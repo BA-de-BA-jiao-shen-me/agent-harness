@@ -1,6 +1,6 @@
 # PyHarness — Enterprise DSH-Grade Agent Harness Runtime & Hybrid RAG Platform
 
-> **一句话定位**：深度对标 **DeepSeek Harness (DSH) + Agentic Control Plane (ACP) + Enterprise AI Hub** 架构标准，从零自研的企业内网可推行级 **AI Agent Harness 平台**（Python 3.11 + FastAPI + Vue 3 + PostgreSQL + Redis + Qdrant + Docker），专注用确定性系统工程驾驭大模型的不确定性。
+> 深度对标 **DeepSeek Harness (DSH) + Agentic Control Plane (ACP) + Enterprise AI Hub** 架构标准，从零自研的企业内网可推行级 **AI Agent Harness 平台**（Python 3.11 + FastAPI + Vue 3 + PostgreSQL + Redis + Qdrant + Docker），专注用确定性系统工程驾驭大模型的不确定性。
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](#quick-start)
 [![FastAPI SSE](https://img.shields.io/badge/API-FastAPI%20Streamable%20SSE-009688.svg)](#architecture)
@@ -88,15 +88,3 @@ cp .env.example .env
 docker compose up -d --build
 # 浏览器打开企业流式工作台: http://localhost:3000
 ```
-
----
-
-## 全部 6 阶段源码精讲、面试手册与交互式实验室
-
-* 🌟 **[交互式全栈架构图例 & 四眼审批 / SHA-256 篡改 / ACP 红队模拟器](docs/interactive_architecture_explorer.html)**（浏览器直接双击即可离线体验！）
-1. [M1 — 运行时内核、SHA-256 事件溯源、多模型熔断与子代理精讲](docs/M1_runtime_mastery.md)
-2. [M2 — 瞬态 SKILL.md、Stdio/OAuth MCP 与 SQL/Docker/E2B 隔离沙箱精讲](docs/M2_skills_mcp_sandbox_mastery.md)
-3. [M3 — 表格保护父子切片、Qdrant 幂等持久化与对话期多租户 ACL 精讲](docs/M3_hybrid_rag_mastery.md)
-4. [M4 — Redis 跨 Pod 协调、Last-Event-ID 重连、OTel/Prometheus 与 Vue 3 工作台精讲](docs/M4_fullstack_deployment_mastery.md)
-5. [M5 — 自动化评测闭环与上海 Agent 面试总监级 15 题通关手册](docs/M5_eval_and_interview_playbook.md)
-6. [M6 — 企业安全控制面（JWT/四眼 SoD/ACP 动态策略/DLP 防注入/FinOps）与 Cordis 插件微内核精讲](docs/M6_enterprise_security_acp_and_plugins_mastery.md)
