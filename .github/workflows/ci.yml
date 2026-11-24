@@ -1,26 +1,55 @@
-name: PyHarness CI
+name: PyHarness Enterprise CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**", "release/**"]
   pull_request:
     branches: [main]
 
 jobs:
-  test-and-eval:
+  backend-test-and-eval:
+    name: Backend Unit, Red-Team & Benchmarks (Python 3.11)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
+      - name: Install package & dev dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      - name: Run full unit & API integration test suite
+      - name: Run full M1-M6 unit, integration & security red-team suite
         run: pytest -v
-      - name: Run RAG & Harness automated benchmarks
+      - name: Run Hybrid RAG & Agent Harness automated benchmarks
         run: |
           python eval/benchmark_rag.py
           python eval/benchmark_harness.py
+
+  frontend-build:
+    name: Web Workbench Build (Vue 3 + TypeScript + Vite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install frontend dependencies
+        run: npm install
+      - name: Build production bundle
+        run: npm run build
+
+  docker-validate:
+    name: Docker Compose & Container Spec Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml schema
+        run: docker compose config --quiet
+      - name: Build API image smoke check
+        run: docker build -t pyharness-api:ci .
+      - name: Build Web image smoke check
+        run: docker build -t pyharness-web:ci ./web

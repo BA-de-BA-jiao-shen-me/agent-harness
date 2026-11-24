@@ -1,0 +1,90 @@
+# PyHarness Enterprise Access Control Policy (ACP)
+#
+# Evaluation semantics:
+#   - Every rule is evaluated on each tool call.
+#   - Rules with `mode: audit` record shadow compliance matches without altering the action.
+#   - Rules with `mode: enforce` resolve by strict safety precedence: deny > ask > allow.
+#   - Regex patterns are compiled with IGNORECASE | DOTALL.
+
+default_action: allow
+
+rules:
+  - id: deny_sql_ddl_destructive
+    description: Block destructive DDL or database attachment commands in mutating SQL tools.
+    mode: enforce
+    action: deny
+    tools:
+      - execute_mutating_sql
+    arg_patterns:
+      sql: '\b(DROP|TRUNCATE|ALTER|ATTACH)\b'
+    reason: Destructive SQL DDL statements (DROP/TRUNCATE/ALTER/ATTACH) are prohibited by enterprise policy.
+
+  - id: deny_sql_mutation_without_where
+    description: Block unscoped DELETE or UPDATE statements lacking a WHERE clause.
+    mode: enforce
+    action: deny
+    tools:
+      - execute_mutating_sql
+    arg_patterns:
+      sql: '\b(DELETE|UPDATE)\b'
+    require_absent_patterns:
+      sql: '\bWHERE\b'
+    reason: DELETE and UPDATE statements must include an explicit WHERE clause to prevent full-table mutation.
+
+  - id: deny_sensitive_tables_non_admin
+    description: Restrict access to sensitive HR and credential tables to administrators only.
+    mode: enforce
+    action: deny
+    tools:
+      - query_sql_readonly
+      - execute_mutating_sql
+    exclude_roles:
+      - admin
+    arg_patterns:
+      sql: '\b(employee_salaries|credentials|user_secrets|api_keys)\b'
+    reason: Access to restricted tables (employee_salaries, credentials, user_secrets, api_keys) requires the admin role.
+
+  - id: deny_viewer_code_sandbox
+    description: Prevent read-only viewer principals from executing arbitrary code in the Python sandbox.
+    mode: enforce
+    action: deny
+    tools:
+      - run_python_sandbox
+    roles:
+      - viewer
+    exclude_roles:
+      - analyst
+      - admin
+    reason: Principals with only the viewer role are not permitted to run code in run_python_sandbox.
+
+  - id: ask_emergency_alert
+    description: Require human-in-the-loop approval before dispatching external emergency alerts.
+    mode: enforce
+    action: ask
+    tools:
+      - mcp_dispatch_emergency_alert
+    required_approver_roles:
+      - approver
+      - admin
+    reason: Dispatching emergency alerts has external operational impact and requires approver or admin sign-off.
+
+  - id: ask_scoped_sql_mutation
+    description: Require human-in-the-loop approval for permitted mutating SQL operations.
+    mode: enforce
+    action: ask
+    tools:
+      - execute_mutating_sql
+    required_approver_roles:
+      - approver
+      - admin
+    reason: Mutating SQL execution requires approval from an approver or admin before running.
+
+  - id: audit_select_star_readonly
+    description: Shadow compliance rule flagging broad SELECT * queries on read-only SQL tools.
+    mode: audit
+    action: ask
+    tools:
+      - query_sql_readonly
+    arg_patterns:
+      sql: 'SELECT\s+\*'
+    reason: Broad SELECT * queries are flagged in shadow audit mode for least-privilege review.

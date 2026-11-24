@@ -21,7 +21,8 @@ class SkillBundle:
 class SkillRouter:
     """
     Loads SKILL.md bundles from disk and dynamically selects relevant skills per turn
-    (inspired by DSH skill-turn-selection.mjs) to avoid bloating every system prompt.
+    (inspired by DSH skill-turn-selection.mjs), resolving both transient instructions
+    and least-privilege `allowed_tools` scopes.
     """
 
     def __init__(self, skills_dir: str | Path) -> None:
@@ -73,17 +74,32 @@ class SkillRouter:
         scored.sort(key=lambda x: (-x[0], x[1].name))
         return [s for _, s in scored[:max_skills]]
 
-    def build_augmented_prompt(self, base_prompt: str, query: str) -> tuple[str, list[SkillBundle]]:
-        selected = self.select_for_query(query)
+    def resolve_turn_context(
+        self,
+        query: str,
+        max_skills: int = 2,
+    ) -> tuple[str | None, set[str] | None, list[SkillBundle]]:
+        """
+        Resolve per-turn transient instructions and least-privilege `allowed_tools` union
+        without mutating persistent session system prompts.
+        """
+        selected = self.select_for_query(query, max_skills=max_skills)
         if not selected:
-            return base_prompt, []
-        blocks = [
-            f"## Active Skill: {s.name}\n{s.instructions}"
-            for s in selected
-        ]
-        augmented = (
-            f"{base_prompt}\n\n"
+            return None, None, []
+
+        blocks = [f"## Active Skill: {s.name}\n{s.instructions}" for s in selected]
+        instructions_block = (
             "=== Dynamically Activated Skills for This Turn ===\n"
             + "\n\n".join(blocks)
         )
-        return augmented, selected
+        permitted: set[str] = set()
+        for s in selected:
+            permitted.update(s.allowed_tools)
+        allowed_set = permitted if permitted else None
+        return instructions_block, allowed_set, selected
+
+    def build_augmented_prompt(self, base_prompt: str, query: str) -> tuple[str, list[SkillBundle]]:
+        instructions_block, _allowed, selected = self.resolve_turn_context(query)
+        if not instructions_block:
+            return base_prompt, []
+        return f"{base_prompt}\n\n{instructions_block}", selected

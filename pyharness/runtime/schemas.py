@@ -12,7 +12,7 @@ class RiskLevel(StrEnum):
     """Tool execution risk tier used by the governance layer."""
 
     LOW = "low"        # Pure read-only / deterministic compute
-    MEDIUM = "medium"  # Network / external search / bounded sandbox
+    MEDIUM = "medium"  # Network / external search / bounded isolated sandbox
     HIGH = "high"      # Mutating SQL, external side-effects -> triggers Human-in-the-Loop approval
 
 
@@ -25,6 +25,11 @@ class EventType(StrEnum):
     TOOL_RESULT = "tool_result"
     APPROVAL_REQUIRED = "approval_required"
     APPROVAL_RESOLVED = "approval_resolved"
+    POLICY_EVALUATED = "policy_evaluated"
+    SECURITY_ALERT = "security_alert"
+    SUBAGENT_START = "subagent_start"
+    SUBAGENT_COMPLETE = "subagent_complete"
+    SESSION_FORKED = "session_forked"
     CONTEXT_COMPRESSED = "context_compressed"
     SELF_CORRECTION = "self_correction"
     TOKEN_DELTA = "token_delta"
@@ -101,6 +106,7 @@ class Message(BaseModel):
 class TokenUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    prompt_cache_hit_tokens: int = 0
     estimated_cost_usd: float = 0.0
 
     @property
@@ -110,6 +116,7 @@ class TokenUsage(BaseModel):
     def add(self, other: TokenUsage) -> None:
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens
+        self.prompt_cache_hit_tokens += other.prompt_cache_hit_tokens
         self.estimated_cost_usd = round(
             self.estimated_cost_usd + other.estimated_cost_usd, 6
         )
@@ -124,6 +131,17 @@ class LLMResponse(BaseModel):
     latency_ms: float = 0.0
 
 
+class LLMStreamChunk(BaseModel):
+    """Incremental chunk yielded by `BaseLLMClient.stream()`."""
+
+    content_delta: str = ""
+    reasoning_delta: str = ""
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    usage: TokenUsage | None = None
+    model: str = ""
+    is_final: bool = False
+
+
 class HarnessEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: f"evt_{uuid.uuid4().hex[:12]}")
     session_id: str
@@ -132,6 +150,10 @@ class HarnessEvent(BaseModel):
     event_type: EventType
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
     payload: dict[str, Any] = Field(default_factory=dict)
+    tenant_id: str = "default"
+    user_id: str = "anonymous"
+    prev_hash: str = ""
+    event_hash: str = ""
 
 
 class TurnResult(BaseModel):
@@ -144,3 +166,38 @@ class TurnResult(BaseModel):
     total_duration_ms: float = 0.0
     error_message: str | None = None
     messages: list[Message] = Field(default_factory=list)
+
+
+class HarnessHook:
+    """
+    Cordis-inspired Composable Lifecycle Hook Seam (`ctx.effect()` equivalent).
+    Allows plugins/policies/guardrails to inspect, redact, or transform LLM context and
+    tool calls without modifying the core `AgentHarnessEngine` state loop.
+    """
+
+    async def before_llm(
+        self,
+        session_id: str,
+        turn_id: str,
+        step: int,
+        messages: list[Message],
+        tools: list[ToolSpec],
+    ) -> tuple[list[Message], list[ToolSpec]]:
+        return messages, tools
+
+    async def before_tool(
+        self,
+        session_id: str,
+        turn_id: str,
+        call: ToolCall,
+    ) -> ToolCall:
+        return call
+
+    async def after_tool(
+        self,
+        session_id: str,
+        turn_id: str,
+        call: ToolCall,
+        result: ToolResult,
+    ) -> ToolResult:
+        return result

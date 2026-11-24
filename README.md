@@ -1,22 +1,24 @@
-# PyHarness — Enterprise Agent Harness Runtime & Hybrid RAG Platform
+# PyHarness — Enterprise DSH-Grade Agent Harness Runtime & Hybrid RAG Platform
 
-> **一句话定位**：受 **DeepSeek Harness (DSH)** 企业级运行时思想启发，从零自研的轻量、透明、生产级 **AI Agent Harness 平台**（Python 3.11 + FastAPI + Vue 3 + Docker），专注用确定性系统工程驾驭大模型的不确定性。
+> **一句话定位**：深度对标 **DeepSeek Harness (DSH) + Agentic Control Plane (ACP) + Enterprise AI Hub** 架构标准，从零自研的企业内网可推行级 **AI Agent Harness 平台**（Python 3.11 + FastAPI + Vue 3 + PostgreSQL + Redis + Qdrant + Docker），专注用确定性系统工程驾驭大模型的不确定性。
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](#quick-start)
 [![FastAPI SSE](https://img.shields.io/badge/API-FastAPI%20Streamable%20SSE-009688.svg)](#architecture)
 [![Vue 3 + TS](https://img.shields.io/badge/Web-Vue3%20%2B%20TypeScript-42b883.svg)](#architecture)
-[![Tests](https://img.shields.io/badge/Tests-16%20Passed%20(0%20Warnings)-brightgreen.svg)](#verified-benchmarks)
+[![Tests](https://img.shields.io/badge/Tests-37%20Passed%20(0%20Warnings)-brightgreen.svg)](#verified-benchmarks)
 
 ---
 
 ## Why PyHarness?
 
-市面上大量 Agent Demo 停留在“调 API + 循环执行”，在真实企业上线时会迅速暴露 **死循环烧 Token、慢工具卡死事件循环、高危操作无审批、RAG 劈裂表格、断线无法恢复** 五大痛点。PyHarness 将全套企业级运行时治理收敛在 **约 3,000 行零黑盒模块化代码** 中：
+市面上大量 Agent Demo 停留在“调 API + 循环执行”，在企业多部门规模化上线时会迅速暴露 **越权跨租户泄露、自提自批高危操作、死循环打爆预算、无策略拦截删库、断线丢失轨迹** 等致命痛点。PyHarness 将全套 L4 企业级运行时治理收敛在清晰透明的零黑盒模块化架构中：
 
-* **Deterministic Runtime & Governance (`pyharness/runtime/`)**：SQLite **Event Journal 事件溯源**（按单调 `seq` 断线重连补发 + Trace 耗时瀑布统计）、`CancellationToken` 会话秒断取消、`ApprovalBroker` 高危工具 **Human-in-the-Loop 审批挂起与 Fail-Closed 超时兜底**、防劈裂 `tool_call/tool` 对的**历史上下文增量摘要压缩**、以及 `asyncio.gather + Semaphore` 限流并发工具调度与 **Self-Correction 连续错误熔断器**。
-* **Skills, Standard MCP & Safe Sandboxes (`pyharness/skills/`, `mcp/`, `sandbox/`)**：按轮次动态加载的声明式 `SKILL.md` 技能路由、标准 **JSON-RPC 2.0 MCP Client/Server 工具桥**、带注入/写操作拦截的只读 SQL 沙箱与 **Python AST 静态审计安全计算沙箱**（彻底封死 `__subclasses__` 逃逸链）。
-* **Enterprise Hybrid RAG (`pyharness/rag/`)**：表格完整保护的 **Parent-Child 层级切片**、Query 多轮指代消解与多跳拆解、中英文混合分词 **Okapi BM25 + 稠密向量检索（可一键切换 BGE-M3）+ RRF 融合 + Cross-Encoder Reranker 精排** + 编号证据引用 `[1][2]`。
-* **Full-Stack Delivery & Eval Flywheel (`pyharness/api/`, `web/`, `eval/`)**：FastAPI **Streamable HTTP / SSE 实时事件流**（`X-Accel-Buffering: no` + Nginx 零缓冲配置）、Vue 3 流式工作台（思考链折叠、高危审批弹窗、实时事件瀑布流）、4 容器 `docker-compose.yml` 一键部署，以及自动归因导出 JSONL（供 LoRA/DPO 微调）的评测套件。
+* **Enterprise Security Control Plane (`pyharness/security/`, `policies/`)**：标准 HS256 JWT / Scoped API Key / 可信网关透传三模鉴权（`AuthManager`）+ `ContextVar` 全链路主体传播、**四眼原则（SoD）防自审批与审批人身份强绑定**、声明式 YAML **动态策略引擎 ACP**（支持 `DENY` / `ASK` / `ALLOW` 与影子 `AUDIT` 灰度模式、防 SQL 注释绕过）、**DLP 脱敏 + 间接 Prompt 注入隔离护栏**（落盘前脱敏保护审计日志），以及 **滑动窗口 RPM 限流 + 部门级 FinOps Token/USD 配额账本**（`/api/v1/admin/usage`）。
+* **Cordis-Inspired Plugin Kernel, Subagents & Multi-Model Router (`pyharness/core/`, `runtime/`)**：基于 `PluginContext`（`provide` / `effect` LIFO 可逆卸载 / `enterprise` & `standalone` & `headless` Profiles）的可组合插件微内核；支持主备故障转移熔断与 `reasoning`/`fast` 分层路由的 **`ModelRouterLLMClient`**；具备上下文硬隔离、策略/护栏全继承与防递归防提权的 **`SubagentManager` (`ctx.subagents`)**；`stream=True` 真增量 SSE 推流与防劈裂上下文增量摘要压缩。
+* **Tamper-Evident Multi-Pod Event Journal & Observability (`pyharness/runtime/journal_store.py`, `infra/`)**：支持 **PostgreSQL 16 多 Pod 事务建议锁 + SQLite WAL 异步写盘** 的存储 Seam、每会话 **SHA-256 防篡改审计哈希链（`/audit/verify`）**、基于事件溯源的 **Session Branching / Forking（`/fork`）**、Redis Pub/Sub 跨实例审批唤醒与 **`Last-Event-ID` 断线重连（`/stream`）**，以及原生 **OpenTelemetry GenAI Trace + Prometheus `/metrics`**。
+* **Standard MCP (`stdio` + OAuth/Bearer HTTP) & Pluggable Safe Sandboxes (`pyharness/mcp/`, `sandbox/`, `skills/`)**：按轮次瞬态注入的 `SKILL.md` 动态路由 + `allowed_tools` 双层强管控；支持内存、**受控净空环境变量 `StdioMCPTransport` 子进程**与带 OAuth/Bearer 透传 + `Mcp-Session-Id` 的 Streamable HTTP MCP 桥；SQLite 内核 `set_authorizer` 只读沙箱（含外部只读仓库适配器 Seam）与 **`DockerSandboxProvider`（`--network=none` / gVisor `runsc`）/ `E2BSandboxProvider`（Firecracker MicroVM）/ 加固独立子进程** 三态可插拔 Python 沙箱。
+* **Multi-Tenant Enterprise Hybrid RAG (`pyharness/rag/`)**：表格完整保护的 **Parent-Child 层级切片**、Query 多轮指代消解与多跳拆解、中英文 Okapi BM25 + **Qdrant 持久化向量库（UUIDv5 幂等更新、重启自动恢复、Agent 对话期强制 `tenant_id` ACL 隔离）** + RRF 融合 + Cross-Encoder 精排。
+* **Full-Stack Enterprise Workbench & Eval Flywheel (`pyharness/api/`, `web/`, `eval/`)**：Vue 3 企业工作台（JWT/API-Key 鉴权栏、`Fork` 分叉、`断线重连`、`SHA-256 审计验签`、策略告警与子代理委派卡片、主管跨用户 SoD 审批收件箱）、6 服务安全加固 `docker-compose.yml` 一键部署及自动化评测套件。
 
 ---
 
@@ -24,12 +26,12 @@
 
 ```mermaid
 flowchart TD
-    WEB["Vue 3 + TS 流式工作台 (思考链 / 工具卡 / 高危审批弹窗 / Trace 瀑布流)"] -->|"POST Streamable HTTP / SSE"| API["FastAPI 异步网关 (SSE / Cancel / Approvals / Replay / RAG)"]
-    API --> RT["AgentHarnessEngine (确定性状态循环 + Semaphore 并发工具 + Self-Correction 熔断)"]
-    RT --> GOV["治理层: EventJournal (SQLite) + CancellationToken + ApprovalBroker + ContextCompressor + TokenBudgetGuard"]
-    RT --> SKILL["能力层: SKILL.md 动态路由 + 标准 MCP JSON-RPC 桥 + SQL 只读/高危沙箱 + Python AST 沙箱"]
-    RT --> RAG["Hybrid RAG: 表格保护父子切片 + Query 改写 + BM25/Dense + RRF + Cross-Encoder 精排"]
-    RT --> EVAL["评测与数据闭环 (eval/): RAG Recall/MRR + 并发延迟压测 + Badcase 导出 JSONL"]
+    WEB["Vue 3 企业工作台 (JWT/API-Key / Fork 分叉 / 断线重连 / 审计验签 / 主管审批收件箱)"] -->|"Streamable SSE & Control API"| CP["控制面: AuthN/RBAC + FinOps Quota (429) + ACP 动态策略引擎 + DLP/防注入护栏"]
+    CP --> CTX["Cordis 风格 PluginContext 微内核 (Profiles / 可逆 effect)"]
+    CTX --> RT["AgentHarnessEngine (真流式 SSE + Multi-Model Failover Router + ctx.subagents 子代理)"]
+    RT --> DATA["分布式持久化与可观测: PostgreSQL/WAL (SHA-256 审计链 & Session Fork) + Redis Pub/Sub + OTel/Prometheus"]
+    RT --> TOOL["隔离执行与生态: SKILL.md 瞬态路由 + MCP (Stdio/OAuth HTTP) + SQL Authorizer + Docker/E2B/子进程沙箱 Seam"]
+    RT --> RAG["Multi-Tenant Hybrid RAG: 表格保护父子切片 + BM25 + Qdrant (强制租户 ACL) + RRF + 精排"]
 ```
 
 ---
@@ -38,22 +40,22 @@ flowchart TD
 
 所有测试与压测均可在仓库内通过 CI 或本地一键复现：
 
-* **单元与端到端 API 集成测试 (`pytest -v`)**：**16 passed in 0.89s（0 Warnings）**
-  * 覆盖并发工具提速、高危审批放行/拒绝、会话中途秒断取消、SQL/参数 Self-Correction 与熔断、上下文增量压缩、SQLite 跨重启事件回放、Token 预算守卫、MCP 工具发现与审批、Python AST 防逃逸、表格完整切片、FastAPI SSE 流式推流与审批回调。
+* **全量单元、集成与企业红队测试 (`pytest -v`)**：**37 passed in 2.52s（0 Warnings）**
+  * 覆盖 JWT/API-Key 鉴权与 `401`/`403`、四眼审批防自批防伪造、跨租户 Session 与对话期 RAG ACL 隔离、ACP 策略引擎硬阻断（含 SQL 注释绕过防御）与影子审计、DLP 落盘前脱敏与 Prompt 注入围栏、RPM `429` 限流与部门 FinOps 报表、Cordis 插件可逆卸载、主备模型熔断降级、`ctx.subagents` 策略继承与递归守卫、SHA-256 防篡改验签与 Session Fork、`Last-Event-ID` 断线重连、真实 `StdioMCPTransport` 子进程握手、Docker/E2B/子进程防 RCE 逃逸与 Qdrant 幂等重启恢复。
 * **Agent Harness 并发工具调度与自修正实测 (`python eval/benchmark_harness.py`)**：
   | 指标 | 实测结果 | 说明 |
   | :--- | :---: | :--- |
-  | 串行工具调用 P50 延迟 (`max_parallel_tools=1`) | **187.83 ms** | 3 路 60ms I/O 工具串行执行 |
-  | 异步并发调用 P50 延迟 (`max_parallel_tools=4`) | **76.40 ms** | **`asyncio.gather + Semaphore`，延迟降低 59.3%** |
+  | 串行工具调用 P50 延迟 (`max_parallel_tools=1`) | **200.90 ms** | 3 路 60ms I/O 工具串行执行 |
+  | 异步并发调用 P50 延迟 (`max_parallel_tools=4`) | **76.83 ms** | **`asyncio.gather + Semaphore`，延迟降低 61.8%** |
   | SQL Self-Correction 异常自修复验证 | **2 / 3 恢复** | 1 条不可恢复轨迹自动触发熔断并导出至 `eval/out/badcases.jsonl` |
 * **Hybrid RAG 离线基准 (`python eval/benchmark_rag.py`)**：
-  * 含 14 个相近工业设备型号/电压等级难负例切片，11 条多领域测试查询下 `hybrid_rerank` 实现 **100.0% Top-1/Top-3 Recall、MRR@3 = 1.0000、P50 = 1.10 ms**；接入 `.env` 后可零代码修改切换至生产级 `BAAI/bge-m3` + `BAAI/bge-reranker-v2-m3`。
+  * 含 14 个相近工业设备型号/电压等级难负例切片，11 条多领域测试查询下 `hybrid_rerank` 实现 **100.0% Top-1/Top-3 Recall、MRR@3 = 1.0000、P50 = 1.08 ms**。
 
 ---
 
 ## Quick Start
 
-### 方式一：本地 Python 一键启动（无需 API Key 即可体验完整演示模式）
+### 方式一：本地 Python 一键启动（默认 `dev_anonymous` 零配置体验全套功能）
 
 ```bash
 git clone <your-repo-url>
@@ -66,30 +68,35 @@ python -m venv .venv
 
 pip install -e ".[dev]"
 
-# 1. 运行全部 16 项自动化测试与 2 套压测基准
+# 1. 运行全部 37 项自动化测试与 2 套压测基准
 pytest -v
 python eval/benchmark_rag.py
 python eval/benchmark_harness.py
 
-# 2. 启动 FastAPI 流式后端（默认内置免 Key 演示规划器；配置 .env 中 LLM_API_KEY 即切真实 DeepSeek/Qwen）
+# 2. 启动 FastAPI 流式后端（默认免 Key 演示规划器；配置 .env 即切真实 DeepSeek/Qwen 与 enforce 鉴权）
 uvicorn pyharness.api.main:app --reload --port 8000
-# 访问 Swagger API 文档: http://127.0.0.1:8000/docs
+# 健康与插件状态: http://127.0.0.1:8000/health
+# Prometheus 指标: http://127.0.0.1:8000/metrics
+# Swagger 文档: http://127.0.0.1:8000/docs
 ```
 
-### 方式二：Docker Compose 生产一键部署（API + Vue 3 Web + Redis + Qdrant）
+### 方式二：Docker Compose 企业级生产一键部署（API + PostgreSQL 16 + Redis + Qdrant + Docker Sandbox Proxy + Vue 3 Web）
 
 ```bash
 cp .env.example .env
+# 生产环境请在 .env 中配置强随机 HARNESS_JWT_SECRET 与 LLM_API_KEY
 docker compose up -d --build
-# 浏览器打开流式工作台: http://localhost:3000
+# 浏览器打开企业流式工作台: http://localhost:3000
 ```
 
 ---
 
-## 全部 5 阶段源码精讲与面试深挖文档（逐阶段吃透！）
+## 全部 6 阶段源码精讲、面试手册与交互式实验室
 
-1. [M1 — 运行时内核、事件溯源、审批挂起与增量压缩精讲](docs/M1_runtime_mastery.md)
-2. [M2 — 声明式 SKILL.md、标准 MCP 协议与 SQL/AST 安全沙箱精讲](docs/M2_skills_mcp_sandbox_mastery.md)
-3. [M3 — 表格保护父子切片、BM25/向量 RRF 融合与 Cross-Encoder 精排精讲](docs/M3_hybrid_rag_mastery.md)
-4. [M4 — FastAPI Streamable SSE、Nginx 零缓冲与 Vue 3 工作台精讲](docs/M4_fullstack_deployment_mastery.md)
-5. [M5 — 自动化评测闭环与上海 Agent 面试总监级通关手册](docs/M5_eval_and_interview_playbook.md)
+* 🌟 **[交互式全栈架构图例 & 四眼审批 / SHA-256 篡改 / ACP 红队模拟器](docs/interactive_architecture_explorer.html)**（浏览器直接双击即可离线体验！）
+1. [M1 — 运行时内核、SHA-256 事件溯源、多模型熔断与子代理精讲](docs/M1_runtime_mastery.md)
+2. [M2 — 瞬态 SKILL.md、Stdio/OAuth MCP 与 SQL/Docker/E2B 隔离沙箱精讲](docs/M2_skills_mcp_sandbox_mastery.md)
+3. [M3 — 表格保护父子切片、Qdrant 幂等持久化与对话期多租户 ACL 精讲](docs/M3_hybrid_rag_mastery.md)
+4. [M4 — Redis 跨 Pod 协调、Last-Event-ID 重连、OTel/Prometheus 与 Vue 3 工作台精讲](docs/M4_fullstack_deployment_mastery.md)
+5. [M5 — 自动化评测闭环与上海 Agent 面试总监级 15 题通关手册](docs/M5_eval_and_interview_playbook.md)
+6. [M6 — 企业安全控制面（JWT/四眼 SoD/ACP 动态策略/DLP 防注入/FinOps）与 Cordis 插件微内核精讲](docs/M6_enterprise_security_acp_and_plugins_mastery.md)

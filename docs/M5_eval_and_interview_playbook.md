@@ -1,39 +1,39 @@
-# Milestone 5 评测闭环精讲与上海 Agent 面试总监级通关手册
+# Milestone 5（L4 升级版）评测闭环精讲与上海 Agent 面试总监级通关手册
 
-> **读完这 5 份 `docs/M1~M5` 并亲手跑完 `pytest` 和 `eval/` 压测后，这个仓库就 100% 变成你自己的硬核代表作！**
+> **全套学习顺序建议**：精读 `M1` → `M2` → `M3` → `M4` → `M6` → `M5`，同时在浏览器里打开 [interactive_architecture_explorer.html](file:///D:/Code/agent-harness/docs/interactive_architecture_explorer.html) 亲手点一遍全部 4 个交互实验室！
 
 ---
 
-## 一、 3 分钟面试高分自我项目阐述逐字稿（直接对标你推上 GitHub 的 `PyHarness`）
+## 一、 3 分钟面试高分自我项目阐述逐字稿（L4 企业级 `PyHarness` 完整版）
 
-> “为了把我在实际业务中沉淀的多智能体和 RAG 架构系统化、开源化，我受 DeepSeek Harness（DSH）生产设计启发，从零自研了一套轻量级企业 Agent Harness 平台 **PyHarness**（Python + FastAPI + Vue 3 + Docker），重点解决大模型落地中的**确定性治理、高并发低延迟、多源 RAG 精度与数据评测闭环**四个核心痛点：
+> “为了把我在企业里做 Multi-Agent、Hybrid RAG 和大模型微调的工程沉淀系统化，我深度对标 **DeepSeek Harness (DSH) + Agentic Control Plane (ACP)** 架构标准，从零自研了一套企业内网可推行级 Agent Harness 平台 **PyHarness**（Python 3.11 + FastAPI + Vue 3 + PostgreSQL + Redis + Qdrant + Docker），目前全量单元、集成与红队安全测试共 **37 项零警告全过**，核心攻克了企业 Agent 落地的 5 大工程难题：
 >
-> 1. **在运行时治理层**，我参考 DSH 实现了基于 SQLite 的 **Event Journal 事件溯源日志**（支持按单调序号 `seq` 断线补发与 Trace 耗时瀑布统计）、基于 `asyncio.Event` 竞态的 **会话级秒断取消**、针对高危操作（写库 SQL / 外发告警）的 **Human-in-the-Loop 审批挂起与 Fail-Closed 超时兜底**，以及**防止劈裂 `tool_call/tool` 消息对的上下文增量摘要压缩**。
-> 2. **在工具与安全层**，采用声明式 `SKILL.md` 按轮次动态路由注入技能，实现了兼容标准 **JSON-RPC 2.0 的 MCP Client/Server 工具桥**，并构建了带 SQL 注入/写操作拦截的只读沙箱与基于 **Python AST 静态语法树审计**的受限计算沙箱（彻底封死 `__subclasses__` 逃逸链）；配合 `asyncio.gather + Semaphore` 限流并发与 `Self-Correction` 连续错误熔断器，实测多工具并发将 P50 响应延迟降低了 **60%+**。
-> 3. **在企业级 Hybrid RAG 层**，我实现了**表格不跨块劈裂的 Parent-Child 层级切片**、Query 多轮指代消解与多跳拆解、**中英文 Okapi BM25 + 向量检索 + RRF 融合 + Cross-Encoder 精排**，在离线评测集上实现了 **Top-1 / Top-3 召回率与 MRR 的显著提升**，并强制带编号引用溯源。
-> 4. **在全栈工程与数据飞轮层**，后端基于 FastAPI 提供 **Streamable HTTP / SSE 实时推流**（配 Nginx `proxy_buffering off` 零缓冲），前端用 Vue 3 + TS 实现思考链折叠、审批弹窗和实时事件流；内置 `eval/` 评测套件可自动归因失败轨迹并导出 JSONL 供后续 Prompt 迭代或 LoRA/DPO 微调。”
+> 1. **企业安全控制面与合规审计**：实现了零外部依赖的 HS256 JWT / Scoped API Key 三模鉴权并通过 `ContextVar` 全链路传播 `Principal`；落地了**四眼原则（SoD）防自审批与跨租户拦截**；设计了声明式 YAML **动态策略引擎 ACP**（按 `DENY > ASK > ALLOW` 裁决、防 SQL 注释绕过、支持影子 `AUDIT` 灰度模式）；在事件落盘前经 **DLP 脱敏 + 中英文间接 Prompt 注入 XML 隔离护栏** 清洗，并集成滑动窗口 RPM 限流与部门级 FinOps 成本分账报表。
+> 2. **微内核运行时、多模型熔断与防提权子代理**：借鉴 Cordis 实现了支持 Profile 切换与 LIFO 原子回滚的 **`PluginContext` 插件微内核**；构建了支持 `reasoning`/`fast` 分层路由与半开探测熔断器的 **`ModelRouterLLMClient`**（流式吐字前无感主备切换）；实现了上下文硬隔离、强制继承父级策略/取消令牌、且防递归防提权的 **`SubagentManager`**；实测 `asyncio.gather + Semaphore` 并发工具调度将 P50 延迟从 **200.9ms 降至 76.8ms（-61.8%）**。
+> 3. **防篡改事件溯源与多 Pod 分布式协作**：抽象 `JournalStorageBackend` 同时支持 SQLite WAL 与 **PostgreSQL 事务级建议锁（`pg_advisory_xact_lock`）**，为每条事件构建 **SHA-256 防篡改审计哈希链（`/audit/verify`）** 与时间点 **Session Forking（`/fork`）**；基于 Redis 实现分布式会话锁、跨 Pod 审批唤醒/取消广播与 **`Last-Event-ID` 断线无损重连**，并暴露 OpenTelemetry GenAI Trace 与 Prometheus `/metrics`。
+> 4. **标准 MCP 与内核/容器级隔离沙箱**：实现了按轮次瞬态注入的 `SKILL.md` 与双层 `allowed_tools` 强管控；支持净空环境变量的真实 **`StdioMCPTransport` 子进程多路复用** 与 OAuth/Bearer Streamable HTTP MCP；SQL 沙箱叠加 SQLite 内核 `set_authorizer`、`progress_handler` 防递归 CTE 炸弹与外部 PG/MySQL 只读适配器；Python 沙箱完成 0-day 反射逃逸红队加固，抽象了 **Subprocess / Docker+gVisor (`--network=none`) / E2B Firecracker MicroVM** 三态 Fail-Closed 插件边界。
+> 5. **多租户 Hybrid RAG 与自动化数据飞轮**：表格保护 Parent-Child 层级切片 + Query 改写 + 中英文 BM25 + **Qdrant 持久化向量库（UUIDv5 幂等、重启自动恢复、对话期强制 `tenant_id` ACL Pre-Filtering）** + RRF 融合 + Cross-Encoder 精排；配合 `eval/` 评测套件自动将不可恢复失败轨迹打根因标签导出 JSONL，直接反哺 Prompt 优化或 LoRA/DPO 后训练。”
 
 ---
 
-## 二、 上海技术总监最爱追问的 10 个压轴难题 & 满分答法
+## 二、 上海技术总监最爱追问的 15 个压轴难题速查索引
 
-1. **Q：你的 `PyHarness` 和直接用 `LangGraph` 相比，核心取舍是什么？**
-   * *答*：LangGraph 强在声明式图编排生态；PyHarness 聚焦**轻量、零黑盒的运行时治理内核**（事件溯源、协程取消、审批挂起、信号量并发、Token 熔断总计不足 500 行），排查线上异步 Bug 极快，且随时可以把 LangGraph 节点作为单个工具挂载进来。
-2. **Q：你们把 Event Journal 存在 SQLite，线上 QPS 上千怎么扛？**
-   * *答*：开源单机 MVP 用 SQLite 实现零依赖一键启动；高并发生产环境按仓库接口抽象平滑切换为 **PostgreSQL（持久化审计事件表）+ Redis Streams / PubSub（实时 SSE 跨 Pod 广播与分布式审批回调）**，上层 Engine 代码一行不用改。
-3. **Q：如果用户在审批弹窗一直不点按钮，后端协程一直挂着会内存泄漏吗？**
-   * *答*：不会！`ApprovalBroker.wait_for_decision` 用 `asyncio.wait` 设了硬超时（如 120s），超时自动 `Fail-Closed` 拒绝并清理 `_pending` 字典；且若前端断开 SSE 连接，网关 `finally` 块也会立刻触发 `CancellationToken` 释放协程。
-4. **Q：Python 沙箱只用 `ast` 静态检查，真上线放给外部用户够安全吗？**
-   * *答*：不够！AST 白名单能防常规反射逃逸，但防不了 `10**10**10` 内存/CPU 死循环炸弹（DoS）。本项目的 AST 审计是第一道轻量防线，真实多租户生产环境我会再叠加 **独立容器/微虚拟机沙箱（如 Docker `--network=none --memory=256m --cpus=0.5` 或 gVisor / E2B）** 做操作系统级隔离！
-5. **Q：Hybrid RAG 里为什么用 RRF 融合，而不用把 BM25 和余弦相似度归一化后加权？**
-   * *答*：BM25 分数无上界且高度依赖文档长度和查询词频，Min-Max 归一化在单次查询候选集里遇到极端值就会失效；RRF 只用倒数排名 $\frac{1}{60+\text{rank}}$，天然尺度无关、无需调参且极为稳健。
-6. **Q：上下文增量摘要压缩时，为什么一定要做 `while body[split_at].role == "tool"` 边界检查？**
-   * *答*：OpenAI/DeepSeek/Qwen 聊天协议强制要求每条 `tool` 消息必须紧跟在声明该 `tool_call_id` 的 `assistant` 消息之后。如果不检查边界硬切，孤立的 `tool` 消息会导致下游 LLM API 直接报 `400 Bad Request` 崩溃。
-7. **Q：你们如何评估一个 Multi-Agent 系统的真实质量，而不只是凭感觉看两句对话？**
-   * *答*：分三层评估——① **检索层**：Top-K Recall、MRR、Ragas Context Recall/Faithfulness；② **过程轨迹层**（看 `eval/benchmark_harness.py`）：工具选择准确率、SQL Self-Correction 修复率、平均步数与并发延迟 P50/P95；③ **数据闭环**：把触发熔断或人工点踩的失败轨迹自动打根因标签导出 JSONL，反哺 Prompt 优化或 LoRA/DPO 微调！
-8. **Q：大模型流式输出时，为什么 Nginx 默认配置会让前端看起来像“卡死 10 秒再瞬间刷屏”？**
-   * *答*：Nginx 默认开启 `proxy_buffering on`，会把上游 FastAPI 吐出的零散 SSE 字节攒满缓冲区才往下游发；必须在 FastAPI 加响应头 `X-Accel-Buffering: no`，并在 Nginx `location /api/` 里配 `proxy_buffering off; proxy_cache off;`。
-9. **Q：如何控制 Agent 系统的单次请求 Token 成本？**
-   * *答*：四管齐下——① `SKILL.md` 按需动态加载（不把全部 SOP 塞进 System Prompt）；② `ContextCompressor` 增量压缩历史工具大段输出；③ `SQLSandbox` 强制加 `LIMIT 100` 防止查出几万行撑爆窗口；④ `TokenBudgetGuard` 硬预算熔断 + 简单路由/改写走小模型（如 Qwen-7B/DeepSeek-Chat），复杂规划走强模型。
-10. **Q：如何把你在工作中的 `Qwen3-VL-32B` 微调经验和这个 Agent Harness 结合？**
-    * *答*：本平台的 `eval/benchmark_harness.py` 已经打通了 Badcase 轨迹自动归因导出 JSONL；在实际业务中，把线上积累的高质量成功轨迹和失败轨迹构造成 SFT/DPO 样本，直接用 LoRA 微调垂类 Qwen 模型，再通过 `OpenAICompatibleLLMClient` 无缝挂载回本 Harness，就能形成完整的 **“Agent 运行 $\rightarrow$ 评测归因 $\rightarrow$ 微调升级 $\rightarrow$ 线上提效”数据飞轮**！
+> 以下 15 题覆盖了从架构选型、分布式并发到红队攻防的全部核心追问（每题的源码级深讲分别位于对应 `M1`–`M6` 手记中）：
+
+| 编号 | 高频压轴追问 | 核武器级答法核心（1 句话抓重点） | 详讲出处 |
+| :---: | :--- | :--- | :---: |
+| **1** | 为什么自研 Harness 而不是直接用 LangChain / Dify？ | 确定性治理透明可控（防坏 JSON、防死循环、秒断取消、防篡改审计、ACP 动态策略），零黑盒风险且可挂载 LangGraph 作为子图。 | [M1](M1_runtime_mastery.md) |
+| **2** | 多 Pod 下两个实例同时往一个会话写事件怎么防 `seq` 乱序？ | PostgreSQL 事务级建议锁 `pg_advisory_xact_lock(hashtext(session_id))` 按会话粒度串行化，不同会话 100% 并发。 | [M1](M1_runtime_mastery.md) |
+| **3** | 主模型流式输出到一半挂了，能无感切备用模型吗？ | 首字未吐（`yielded_any=False`）秒切备模型；已吐部分 Token 禁止静默拼接防语义撕裂，直接报错并计入熔断器。 | [M1](M1_runtime_mastery.md) |
+| **4** | 子代理委派（Subagent）怎么防越权提权和无限套娃？ | `ContextVar` 追踪深度到 `max_depth` 剥离委派工具 + 默认剥离 `HIGH` 风险工具 + 有效工具与父级取交集 + 强制继承父策略/DLP/取消令牌。 | [M1](M1_runtime_mastery.md) |
+| **5** | 上下文增量摘要压缩最隐蔽的生产 Bug 是什么？ | 切分边界不能劈开 `assistant(tool_calls)` 和 `role="tool"` 配对消息，否则下游 LLM API 必报 400。 | [M1](M1_runtime_mastery.md) |
+| **6** | 怎么防第 1 轮加载的 Skill 污染第 2 轮对话？ | 持久化 `history[0]` 永远保持纯净基础 System Prompt，Skill 指令与 `allowed_tools` 仅作单轮瞬态合成并在执行层二次拦截。 | [M2](M2_skills_mcp_sandbox_mastery.md) |
+| **7** | Python 沙箱只禁 `__class__` 为什么还会被攻破？怎么修？ | 存在 `collections._sys` 单下划线泄露和 `"{0.__globals__}".format()` 运行时解析逃逸；必须禁一切 `_` 属性 + `format` + OS/Docker `runsc`/MicroVM 物理隔离。 | [M2](M2_skills_mcp_sandbox_mastery.md) |
+| **8** | SQL 只读沙箱怎么防 `WITH RECURSIVE` 无限递归 CPU 炸弹？ | SQLite 内核 `set_authorizer` 保只读 + `set_progress_handler` 限时强杀 + `fetchmany(max_rows+1)` 游标截断；外部库用 `SET TRANSACTION READ ONLY` + `statement_timeout`。 | [M2](M2_skills_mcp_sandbox_mastery.md) |
+| **9** | Stdio MCP 子进程怎么防宿主机密钥泄露和僵尸进程？ | 最小 OS 环境变量白名单净空 `LLM_API_KEY` + 独立协程抽干 `stderr` 防管道死锁 + 按 JSON-RPC `id` 多路复用 + `stdin->terminate->kill` 兜底。 | [M2](M2_skills_mcp_sandbox_mastery.md) |
+| **10** | 多租户 RAG 为什么不能搜完 Top-10 再在 Python 过滤租户？ | Post-Filtering 会导致召回坍塌甚至空结果；必须下推为 Qdrant `filter.must` 与 BM25 检索期 Pre-Filtering！ | [M3](M3_hybrid_rag_mastery.md) |
+| **11** | SSE 断线重连怎么做到不丢事件也不重复发事件？ | 带 `Last-Event-ID` 先订阅实时队列、再回放 `seq > after_seq` 历史事件，切回实时队列后按 `seq > last_sent_seq` 去重。 | [M4](M4_fullstack_deployment_mastery.md) |
+| **12** | Nginx 代理 SSE 为什么会憋住不流式输出？ | 默认开启了 `proxy_buffering on`；必须配置 Nginx `proxy_buffering off` + 响应头 `X-Accel-Buffering: no`。 | [M4](M4_fullstack_deployment_mastery.md) |
+| **13** | 攻击者用 `DELETE FROM tbl -- WHERE 1=1` 绕过正则策略怎么防？ | `PolicyEngine` 在正则匹配前先剥离单引号外部的 `--` 与 `/* */` SQL 注释，同时按严格 `DENY > ASK > ALLOW` 优先级裁决。 | [M6](M6_enterprise_security_acp_and_plugins_mastery.md) |
+| **14** | 怎么防用户自提自批高危操作或伪造 `reviewer="admin"`？ | 完全忽略请求体 `reviewer`，从加密鉴权的 `Principal` 绑定真实审批人，强校验 `principal.user_id != requester_id` 且同租户且具 `approver/admin` 角色。 | [M6](M6_enterprise_security_acp_and_plugins_mastery.md) |
+| **15** | 怎么把 Agent 线上失败轨迹变成模型能力提升飞轮？ | `eval/benchmark_harness.py` 自动识别触发熔断或失败轨迹，提取 `error_type` 根因标签导出标准 JSONL，直接用于 Prompt 迭代或 LoRA/DPO 后训练微调！ | [M5](M5_eval_and_interview_playbook.md) |

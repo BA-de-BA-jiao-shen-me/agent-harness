@@ -1,4 +1,5 @@
 from pyharness.rag.chunker import ChildChunk, HierarchicalChunker, ParentChunk
+from pyharness.rag.qdrant_store import BaseVectorStore, QdrantVectorStore
 from pyharness.rag.query_rewriter import QueryRewriter, RewrittenQuery
 from pyharness.rag.retriever import (
     BM25Index,
@@ -18,6 +19,7 @@ __all__ = [
     "BM25Index",
     "BaseEmbedder",
     "BaseReranker",
+    "BaseVectorStore",
     "ChildChunk",
     "DenseVectorIndex",
     "HTTPCrossEncoderReranker",
@@ -27,6 +29,7 @@ __all__ = [
     "LexicalSemanticReranker",
     "OpenAICompatibleEmbedder",
     "ParentChunk",
+    "QdrantVectorStore",
     "QueryRewriter",
     "RetrievalHit",
     "RewrittenQuery",

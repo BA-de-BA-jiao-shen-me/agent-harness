@@ -1,6 +1,19 @@
-from pyharness.runtime.engine import AgentHarnessEngine, HarnessConfig, ToolRegistry
-from pyharness.runtime.event_journal import EventJournal
+from pyharness.runtime.engine import (
+    AgentHarnessEngine,
+    HarnessConfig,
+    HarnessHook,
+    ToolRegistry,
+)
+from pyharness.runtime.event_journal import (
+    AuditVerificationResult,
+    EventJournal,
+    JournalStorageBackend,
+    PostgresJournalStore,
+    SQLiteJournalStore,
+    SessionRecord,
+)
 from pyharness.runtime.governance import (
+    ApprovalAuthorizationError,
     ApprovalBroker,
     ApprovalDecision,
     CancellationToken,
@@ -13,10 +26,12 @@ from pyharness.runtime.llm_client import (
     OpenAICompatibleLLMClient,
     ScriptedMockLLMClient,
 )
+from pyharness.runtime.model_router import ModelRoute, ModelRouterLLMClient
 from pyharness.runtime.schemas import (
     EventType,
     HarnessEvent,
     LLMResponse,
+    LLMStreamChunk,
     Message,
     RiskLevel,
     TokenUsage,
@@ -26,23 +41,41 @@ from pyharness.runtime.schemas import (
     TurnResult,
     TurnStatus,
 )
+from pyharness.runtime.subagents import (
+    DEFAULT_SUBAGENT_PROFILES,
+    SubagentManager,
+    SubagentProfile,
+)
 
 __all__ = [
     "AgentHarnessEngine",
+    "ApprovalAuthorizationError",
     "ApprovalBroker",
     "ApprovalDecision",
+    "AuditVerificationResult",
     "BaseLLMClient",
     "CancellationToken",
     "ContextCompressor",
+    "DEFAULT_SUBAGENT_PROFILES",
     "EventJournal",
     "EventType",
     "HarnessConfig",
     "HarnessEvent",
+    "HarnessHook",
+    "JournalStorageBackend",
     "LLMResponse",
+    "LLMStreamChunk",
     "Message",
+    "ModelRoute",
+    "ModelRouterLLMClient",
     "OpenAICompatibleLLMClient",
+    "PostgresJournalStore",
     "RiskLevel",
+    "SQLiteJournalStore",
     "ScriptedMockLLMClient",
+    "SessionRecord",
+    "SubagentManager",
+    "SubagentProfile",
     "TokenBudgetGuard",
     "TokenUsage",
     "ToolCall",

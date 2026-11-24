@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import ast
-import io
+import asyncio
+import concurrent.futures
 import json
-import math
-import statistics
-from contextlib import redirect_stdout
-from typing import Any
 
 from pyharness.runtime.engine import ToolRegistry
 from pyharness.runtime.schemas import RiskLevel, ToolSpec
+from pyharness.sandbox.providers import (
+    SandboxProvider,
+    SubprocessSandboxProvider,
+)
 
 _ALLOWED_IMPORTS = {"math", "statistics", "json", "datetime", "collections", "re"}
 _FORBIDDEN_CALLS = {
@@ -26,50 +27,37 @@ _FORBIDDEN_CALLS = {
     "vars",
     "breakpoint",
     "input",
+    "dir",
+    "type",
 }
-_SAFE_BUILTINS: dict[str, Any] = {
-    "abs": abs,
-    "all": all,
-    "any": any,
-    "bool": bool,
-    "dict": dict,
-    "enumerate": enumerate,
-    "filter": filter,
-    "float": float,
-    "int": int,
-    "len": len,
-    "list": list,
-    "map": map,
-    "max": max,
-    "min": min,
-    "pow": pow,
-    "print": print,
-    "range": range,
-    "round": round,
-    "set": set,
-    "sorted": sorted,
-    "str": str,
-    "sum": sum,
-    "tuple": tuple,
-    "zip": zip,
-}
+_REFLECTIVE_ATTRS = {"format", "format_map"}
 
 
 class SandboxSecurityError(ValueError):
-    """Raised when Python code fails static AST security audit."""
+    """Raised when Python code fails static AST security pre-flight audit."""
 
 
 class PythonSandbox:
     """
-    AST-Audited Restricted Python Computation Sandbox.
+    Governed Python Computation Sandbox backed by a pluggable `SandboxProvider` seam
+    (`DockerSandboxProvider` | `E2BSandboxProvider` | `SubprocessSandboxProvider`).
 
-    Defense-in-depth protections (great interview talking points):
-    1. Parses code via `ast.parse` BEFORE execution.
-    2. Blocks all dunder attribute access (e.g., `__class__`, `__subclasses__`, `__globals__`)
-       preventing classic Python sandbox breakout chains.
-    3. Restricts `import` strictly to a pure-math/data whitelist (`math`, `statistics`, `json`...).
-    4. Strips `__builtins__` down to a minimal safe subset and captures stdout cleanly.
+    Defense-in-depth protections:
+    1. Pre-flight `audit_ast` rejects non-whitelisted imports, ALL private/dunder attributes
+       (`attr.startswith("_")` — closing `collections._sys` & `__subclasses__` chains),
+       and C-level string formatting reflection (`str.format` / `str.format_map`).
+    2. Delegates execution out-of-process to `SandboxProvider` (ephemeral `--network=none`
+       Docker container, Firecracker E2B MicroVM, or scrubbed-env isolated subprocess)
+       eliminating host GIL starvation, host secret leaks, and cross-thread stdout bleed.
     """
+
+    def __init__(
+        self,
+        provider: SandboxProvider | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self.provider: SandboxProvider = provider or SubprocessSandboxProvider()
+        self.timeout_seconds = timeout_seconds
 
     @staticmethod
     def audit_ast(code: str) -> ast.Module:
@@ -79,7 +67,7 @@ class PythonSandbox:
             raise SyntaxError(f"Python syntax error at line {exc.lineno}: {exc.msg}") from exc
 
         for node in ast.walk(tree):
-            # 1. Block dangerous imports
+            # 1. Block non-whitelisted imports
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     root = alias.name.split(".")[0]
@@ -93,60 +81,54 @@ class PythonSandbox:
                     raise SandboxSecurityError(
                         f"Import from '{node.module}' is forbidden in sandbox."
                     )
-            # 2. Block dunder attribute access (prevents object.__subclasses__() escape!)
+            # 2. Block ALL single/double underscore private & dunder attributes + str.format reflection
             elif isinstance(node, ast.Attribute):
-                if node.attr.startswith("__"):
+                if node.attr.startswith("_") or node.attr in _REFLECTIVE_ATTRS:
                     raise SandboxSecurityError(
-                        f"Access to dunder attribute '{node.attr}' is forbidden for sandbox safety."
+                        f"Access to private/dunder or reflective attribute '{node.attr}' is forbidden for sandbox safety."
                     )
-            # 3. Block forbidden builtin calls & dunder names
+            # 3. Block forbidden builtin calls & underscore identifiers
             elif isinstance(node, ast.Name):
-                if node.id.startswith("__") or node.id in _FORBIDDEN_CALLS:
+                if node.id.startswith("_") or node.id in _FORBIDDEN_CALLS:
                     raise SandboxSecurityError(f"Use of '{node.id}' is forbidden in sandbox.")
         return tree
 
-    def run(self, code: str) -> str:
-        tree = self.audit_ast(code)
-        safe_globals: dict[str, Any] = {
-            "__builtins__": _SAFE_BUILTINS,
-            "math": math,
-            "statistics": statistics,
-            "json": json,
-        }
-        # Support whitelisted `import math` statements safely
-        def _safe_import(name: str, *_args: Any, **_kwargs: Any) -> Any:
-            root = name.split(".")[0]
-            if root not in _ALLOWED_IMPORTS:
-                raise SandboxSecurityError(f"Forbidden import: {name}")
-            return __import__(name)
-
-        safe_globals["__builtins__"] = {**_SAFE_BUILTINS, "__import__": _safe_import}
-        local_ns: dict[str, Any] = {}
-        stdout_buf = io.StringIO()
-
-        with redirect_stdout(stdout_buf):
-            exec(compile(tree, filename="<pyharness_sandbox>", mode="exec"), safe_globals, local_ns)
-
-        output = stdout_buf.getvalue().strip()
-        result_val = local_ns.get("result")
+    async def arun(self, code: str) -> str:
+        # Layer 1: zero-latency host AST pre-check before touching container/VM runtime
+        self.audit_ast(code)
+        # Layer 2: isolated process / Docker container / E2B MicroVM execution
+        exec_res = await self.provider.execute(code=code, timeout_seconds=self.timeout_seconds)
         payload = {
-            "stdout": output,
-            "result": result_val if isinstance(result_val, (int, float, str, list, dict, bool, type(None))) else repr(result_val),
+            "stdout": exec_res.stdout,
+            "result": exec_res.result,
+            "sandbox_provider": exec_res.provider,
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    def run(self, code: str) -> str:
+        """Synchronous convenience wrapper preserving backward compatibility for callers/tests."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun(code))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(lambda: asyncio.run(self.arun(code))).result()
+
+    async def aclose(self) -> None:
+        await self.provider.aclose()
 
     def register_tools(self, registry: ToolRegistry) -> None:
         registry.register(
             ToolSpec(
                 name="run_python_sandbox",
-                description="在 AST 安全审计受限沙箱中执行纯数值/统计 Python 代码（可赋值给 result 或 print 输出）",
+                description="在进程/容器隔离且经 AST 安全审计的受限沙箱中执行纯数值/统计 Python 代码（可赋值给 result 或 print 输出）",
                 parameters={
                     "type": "object",
                     "properties": {"code": {"type": "string", "description": "待执行的 Python 代码"}},
                     "required": ["code"],
                 },
                 risk_level=RiskLevel.MEDIUM,
-                timeout_seconds=10.0,
+                timeout_seconds=self.timeout_seconds + 2.0,
             ),
-            self.run,
+            self.arun,
         )

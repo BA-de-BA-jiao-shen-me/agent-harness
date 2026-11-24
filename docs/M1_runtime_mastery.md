@@ -1,74 +1,125 @@
-# Milestone 1 源码精讲与上海一面深挖手记（Agent Harness 运行时内核）
+# Milestone 1（企业升级版）源码精讲：Harness 运行时内核、防篡改事件溯源、多模型熔断与子代理委派
 
-> **学习目标**：拒绝“代码是 AI 帮我写的，面试一问就露馅”！请逐文件对照源码阅读本手记，确保你能**脱稿画出架构图、讲清每一项工程权衡，并亲手完成文末 2 道小改造练习**。
-
----
-
-## 一、 架构全景：为什么我们要自研 Agent Harness，而不是直接套壳 LangChain？
-
-你在上海面试 **Agent 工程师 / 大模型落地** 时，80% 的技术主管都会先问你一个灵魂问题：
-> **“市面上现成的 LangChain / Dify / CrewAI 这么多，你们为什么还要自研或深度定制 Agent Harness？”**
-
-学完 Milestone 1 的 5 个文件，你现在可以给出一个让面试官眼前一亮的**生产级回答**：
-1. **确定性治理（Harness Engineering）**：大模型本身是非确定性的（会输出坏 JSON、死循环调同一个失败工具、误删生产数据），必须用确定性的状态机外壳把不确定性关进笼子里（`max_steps`、`max_consecutive_errors`、`TokenBudgetGuard`、`ApprovalBroker`）。
-2. **可中断与可观测（参考 DeepSeek Harness 设计）**：很多通用编排框架在异步流式中断（用户点“停止生成”瞬间杀掉正在跑的慢工具）和事件级回放（Event Sourcing）上抽象太黑盒，线上排错困难。我们在 `event_journal.py` 和 `governance.py` 中仅用 ~300 行清晰代码就实现了 **SQLite 持久化事件流 + 实时 SSE 订阅广播 + 协程级秒断取消**。
-3. **无厂商 SDK 锁定**：`llm_client.py` 直接基于 `httpx.AsyncClient` 对接标准 OpenAI Chat Completions 协议，DeepSeek、Qwen DashScope、本地 vLLM/SGLang 零改动切换。
+> **对应最新源码**：
+> - [schemas.py](file:///D:/Code/agent-harness/pyharness/runtime/schemas.py) | [engine.py](file:///D:/Code/agent-harness/pyharness/runtime/engine.py) | [governance.py](file:///D:/Code/agent-harness/pyharness/runtime/governance.py)
+> - [event_journal.py](file:///D:/Code/agent-harness/pyharness/runtime/event_journal.py) | [journal_store.py](file:///D:/Code/agent-harness/pyharness/runtime/journal_store.py)
+> - [llm_client.py](file:///D:/Code/agent-harness/pyharness/runtime/llm_client.py) | [model_router.py](file:///D:/Code/agent-harness/pyharness/runtime/model_router.py) | [subagents.py](file:///D:/Code/agent-harness/pyharness/runtime/subagents.py)
+> - **交互式实验**：打开 [interactive_architecture_explorer.html](file:///D:/Code/agent-harness/docs/interactive_architecture_explorer.html) 体验 Tab 2（全链路模拟）与 Tab 3（SHA-256 防篡改验签 + Session Fork）！
 
 ---
 
-## 二、 逐文件源码核心拆解（对照代码精读 20 分钟彻底吃透）
+## 一、 核心设计哲学：什么是 L4 级 Agent Harness Engineering？
 
-### 1. `pyharness/runtime/event_journal.py`（对应 DSH `event-journal.mjs`）
-* **核心思想：事件溯源（Event Sourcing）**。
-  * Agent 执行的每一步不是“打印一行 `print` 日志就算了”，而是生成带严格单调递增序号 `seq` 的 `HarnessEvent`，原子写入 SQLite，同时通过 `asyncio.Queue` 广播给所有在线订阅者（Milestone 4 的 FastAPI SSE 接口直接 `subscribe()` 就能把思考链、工具调用和审批卡片推给前端！）。
-  * **断线重连怎么实现？** 前端断网重连时把上次收到的 `last_seq` 发过来，后端调用 `replay_session(session_id, after_seq=last_seq)` 就能无遗漏补发漏掉的事件！
-  * **为什么要加 `asyncio.Lock()`？** 因为工具是并发执行的（`asyncio.gather`），如果不加锁，多个并发工具同时分配 `seq` 会导致序号冲突乱序。
+在生产环境里，大语言模型本质是一个**高波动概率引擎**（可能输出坏 JSON、陷入失败工具死循环、在无权限时调用高危操作、遇到厂商 API 503 限流）。**Agent Harness（运行时缰绳）**的核心使命是：**用 100% 确定性的软件工程系统把概率模型关进安全、可控、可中断、可审计的牢笼中运行**。
 
-### 2. `pyharness/runtime/governance.py`（对应 DSH `session-cancellation` + `approval-broker`）
-* **`CancellationToken`（协作式取消）**：
-  * 底层是一个 `asyncio.Event`。在 `engine.py` 的 `_await_with_cancellation()` 中，我们用 `asyncio.wait({work_task, cancel_task}, return_when=FIRST_COMPLETED)` 让**任何耗时操作（调 LLM、跑工具、等人工审批）与取消信号赛跑**！
-  * 一旦用户点停止，`cancel_task` 毫秒级获胜，立即 `work_task.cancel()` 终止协程并落盘 `TURN_CANCELLED`，彻底避免后台僵尸协程继续空烧 Token！
-* **`ApprovalBroker`（Human-in-the-Loop 高危审批）**：
-  * 当工具声明 `risk_level=RiskLevel.HIGH`（如写库 SQL、发外部请求），引擎调用 `create_request()` 生成一个挂起的 `asyncio.Future`，向事件流发出 `APPROVAL_REQUIRED`，然后原地异步挂起（**不阻塞事件循环，其他用户的会话照常并发运行！**）。
-  * 前端用户点“批准/拒绝”调后端接口触发 `broker.resolve(approval_id, approved=...)`，`Future` 立刻被唤醒恢复执行；**如果超时没人理，默认 Fail-Closed（安全拒绝），绝不自动放行高危操作！**
-* **`ContextCompressor`（历史状态增量摘要压缩）**：
-  * **一个极其细节的生产防坑点（看 `governance.py` 第 198 行！）**：
-    ```python
-    while split_at > 0 and body[split_at].role == "tool":
-        split_at -= 1
-    ```
-    **为什么要写这行 `while`？** 因为 OpenAI/DeepSeek/Qwen 协议严格要求 `role="tool"` 消息**前面必须紧跟着对应的 `assistant(tool_calls)` 消息**！如果按固定条数硬切上下文，把 `assistant` 切进摘要而把孤零零的 `tool` 留在近期消息里，下一次调大模型 API 会直接 400 报错崩溃！你面试讲出这个细节，面试官立刻知道你真踩过生产坑！
-
-### 3. `pyharness/runtime/engine.py`（确定性编排与 Self-Correction）
-* **为什么并发工具调度还要套一个 `asyncio.Semaphore(max_parallel_tools)`？**
-  如果模型一次吐出 20 个并发检索/API 调用，裸跑 `asyncio.gather` 会瞬间打爆下游数据库或触发外部 API 限流（429）；套上信号量既拿到了并发低延迟红利，又守住了系统稳定性底线。
-* **Self-Correction 闭环 + 熔断器（Circuit Breaker）**：
-  当工具出现 JSON 解析错、缺少必填参数或运行时报错（如 SQL 语法错），引擎不直接抛异常崩掉整个会话，而是把结构化错误包装成 `role="tool"` 喂回给大模型触发自省修复，同时递增 `consecutive_errors`——一旦**成功执行一步立刻清零**；连续错满 `max_consecutive_errors` 次立刻熔断退出，彻底杜绝无限死循环烧光 API 余额！
+升级后的 Runtime 内核包含 6 大支柱：
+1. **可插拔持久化事件溯源 + SHA-256 防篡改审计链**（`EventJournal` + `JournalStorageBackend`）
+2. **协作式取消 + 四眼原则审批 + 防劈裂增量上下文压缩**（`governance.py`）
+3. **真增量流式推流 + 信号量并发工具 + Self-Correction 熔断**（`engine.py`）
+4. **分层多模型路由与半开探测熔断降级**（`ModelRouterLLMClient`）
+5. **上下文硬隔离 + 零提权递归守卫子代理**（`SubagentManager`）
+6. **可逆生命周期插件钩子**（`HarnessHook`）
 
 ---
 
-## 三、 上海 BOSS直聘 Agent 面试：8 道必问深挖题（基于 M1 源码直接答！）
+## 二、 逐模块源码深度拆解
 
-1. **Q1：为什么要用 Event Sourcing（事件溯源）记录 Agent 执行，而不是只存最终问答对？**
-   * *答*：支持前端断线按 `seq` 增量补发、支持 Trace 耗时瀑布图定位慢工具瓶颈、支持把每条轨迹连同 Badcase 导出用于离线评测和后续微调（对应你简历里的细粒度轨迹评测）。
-2. **Q2：异步并发调用多个工具时，同步阻塞函数（如老式 `requests` / `sqlite3` / CPU 密集解析）会卡死整个 FastAPI 事件循环，怎么解决？**
-   * *答*：看 `engine.py` 第 207 行——用 `inspect.iscoroutinefunction()` 自动探测，异步函数直接 `await`，同步函数自动丢进 `asyncio.to_thread()` 线程池执行，绝不阻塞主 Event Loop。
-3. **Q3：Human-in-the-Loop 审批挂起时，后端内存里的 `asyncio.Future` 在多进程/多实例集群（如 K8s 多个 Pod）下会有什么问题？怎么演进？**
-   * *答*：单机用内存 `Future` 极简高效；多实例部署时用户审批请求可能打到另一个 Pod，演进方案是把待审批状态存进 **Redis（带 TTL）**，审批接口通过 **Redis Pub/Sub** 广播唤醒持有该会话协程的 Pod，或者直接把 Checkpoint 持久化后彻底释放协程、收到审批回调再从 Checkpoint 重建恢复！
-4. **Q4：上下文压缩（Context Compression）怎么防止把关键业务数字（如金额、ID、报错码）压缩丢掉？**
-   * *答*：保留首条 `system` 约束与最近 $N$ 轮完整对话；压缩中间历史时采用**结构化槽位摘要模板**（强制保留实体 ID、SQL 表名、已确认结论、失败报错原因），并在截断边界确保不劈开 `assistant(tool_calls)` 与 `tool` 消息对。
-5. **Q5：Agent 陷入 Self-Correction 死循环（反复改同一个错 SQL）怎么处理？**
-   * *答*：双保险——`max_consecutive_errors` 连续失败熔断器 + `max_steps` 全局步数上限 + `TokenBudgetGuard` 预算封顶；进阶可在重试超过 2 次时自动切换更强推理模型（Fallback）或转人工接管。
-6. **Q6：为什么还要写一个 `ScriptedMockLLMClient`（确定性测试桩）？**
-   * *答*：真实 LLM 输出随机且耗钱耗时，无法进 CI 回归测试。用确定性 Mock 可以毫秒级覆盖 100% 边界条件（并行提速、审批拒绝、取消中断、熔断器、压缩边界），确保重构 Harness 引擎绝不引入 Regression。
-7. **Q7：Token 估算用字符启发式和 `tiktoken` 有什么区别？线上怎么选？**
-   * *答*：`tiktoken` 仅精确对应 OpenAI 词表，对 Qwen/DeepSeek 仍有误差且引入额外依赖；生产上用“偏保守字符启发式（中文/英文约 2.5 char/token）触发提前压缩 + 以 LLM 返回的真实 `usage` 做精准成本计费与预算熔断”是性价比最高的组合。
-8. **Q8：你这套 Harness 和 LangGraph 的设计异同是什么？**
-   * *答*：LangGraph 用显式 DAG/Cyclic StateGraph 声明节点与边，生态丰富适合快速拼装；自研 PyHarness 围绕**企业运行时治理**做极致透明化（事件溯源、协程秒断取消、审批 Broker、并发信号量），核心代码不到 500 行，无版本升级黑盒风险，也极易按需接回 LangGraph 节点作为子图。
+### 模块 1：防篡改事件溯源与会话分叉（`event_journal.py` & `journal_store.py`）
+
+#### 1. 为什么把存储层抽象出 `JournalStorageBackend` Seam？
+早期版本把 SQLite 硬编码在 `EventJournal` 里，多实例 K8s 部署时多个 Pod 各自写本地文件会直接分裂！新版抽离出 `JournalStorageBackend` 接口，提供两套零改动切换的后端：
+* **`SQLiteJournalStore`（本地 / 单机）**：启用 WAL（Write-Ahead Logging）模式支持并发读，内部线程锁保护单调 `seq`。
+* **`PostgresJournalStore`（企业多 Pod 生产集群）**：在写入事件前执行事务级建议锁（`pg_advisory_xact_lock(hashtext(session_id))`），确保即使 10 个 FastAPI Pod 同时往同一个 `session_id` 写事件，序号 `seq` 和哈希链也绝对严格递增、永不冲突！
+
+#### 2. SHA-256 防篡改审计哈希链（`compute_event_hash` & `verify_chain`）
+看 `journal_store.py` 第 52–70 行：每条事件落盘时，不仅保存自身载荷，还把**上一条事件的哈希 `prev_hash`**（首条为 64 个 `'0'` 的 `GENESIS_HASH`）与当前全部关键字段拼接做 SHA-256：
+
+```text
+event_hash(seq) = SHA256(
+    prev_hash | session_id | seq | event_type | timestamp_ms | tenant_id | user_id | canonical_payload_json
+)
+```
+
+* **怎么防内部运维篡改日志？** 假设有人直接登录数据库，偷偷把第 3 条事件里的 `"approved": false` 改成 `"approved": true`。当审计员调用 `GET /api/v1/sessions/{id}/audit/verify` 时，`_verify_rows()` 从 `GENESIS_HASH` 开始逐条重算哈希：
+  1. `seq=3` 重算出的 `recomputed != stored_event_hash` $\rightarrow$ 立刻报 `valid=False, broken_at_seq=3`！
+  2. 即使黑客顺手重算了第 3 条的 `event_hash`，第 4 条的 `prev_hash` 也会立刻断链暴露！
+  3. 同时检查 `seq == expected_seq`（防偷偷 `DELETE` 删掉某条中间日志！）。
+
+#### 3. 基于事件溯源的 Session Forking（会话时间点分叉 `/fork`）
+因为所有历史状态均由有序事件流决定，系统支持在任意历史检查点 `at_seq` 克隆出一条全新子会话（`parent_session_id` + `forked_from_seq`），重新计算新会话独立的 SHA-256 链并追加 `session_forked` 事件。
+* **业务价值**：用户在第 5 步发现推理走偏，不用从头重聊，直接在第 3 步 **Fork 分叉** 换一种提问或参数做平行对比实验（类似 Git Branch）！
 
 ---
 
-## 四、 课后动手小练习（强烈建议亲手改 10 分钟，改完代码就真属于你了！）
+### 模块 2：多模型分层路由与熔断器（`pyharness/runtime/model_router.py`）
 
-1. **练习 1（10 分钟）**：打开 `pyharness/runtime/governance.py` 的 `ApprovalBroker.wait_for_decision`，在 `tests/test_m1_runtime.py` 里自己补充第 8 个单元测试 `test_approval_timeout_fails_closed()`——设置 `approval_timeout_seconds=0.1`，不调用 `resolve()`，验证超时后系统是否安全拒绝执行高危工具！
-2. **练习 2（5 分钟）**：如果你手头有 DeepSeek 或阿里云通义千问 API Key，写一个 15 行的 `demo_live.py` 用 `OpenAICompatibleLLMClient` 跑通一次真实模型调用并打印 `journal.build_trace_summary(...)`！
+企业在生产中绝不能只绑死 1 个模型厂商（DeepSeek 高峰期可能 503/429，且用贵价推理模型去做简单 Query 改写极度烧钱！）。
+
+#### 1. 分层路由（Tiered Routing）+ 透明代理 `_TierScopedLLMProxy`
+* 为不同任务配置不同 `tier`：
+  * `tier="reasoning"`：主规划、复杂多跳决策（例如 DeepSeek-R1 / Qwen-Max，按 `priority=0, 1` 排主备）；
+  * `tier="fast"`：上下文摘要压缩、Query 改写、只读子代理（例如 Qwen-Turbo / DeepSeek-Chat，低延迟低成本）。
+* `router.for_tier("fast")` 返回一个符合 `BaseLLMClient` 接口的轻量代理，直接注入 `ContextCompressor`、`QueryRewriter` 和 `SubagentManager`，下游模块完全无感知！
+
+#### 2. 熔断器状态机（Closed $\rightarrow$ Open $\rightarrow$ Half-Open Probe）
+```mermaid
+stateDiagram-v2
+    [*] --> Closed: 初始健康状态 (failures=0)
+    Closed --> Closed: 调用成功 (failures清零)
+    Closed --> Open: 连续失败达到 failure_threshold (设定 open_until = now + cooldown)
+    Open --> Closed: 冷却期结束或所有线路均熔断触发半开探测成功
+    Open --> Open: 半开探测失败 (继续延长冷却期)
+```
+* **极其精致的流式防撕裂细节（看 `model_router.py` 第 166–170 行！）**：
+  * 如果主模型在**吐出第 1 个 Token 之前**就报 503/超时（`yielded_any == False`）$\rightarrow$ **无感秒切备用模型**，用户完全察觉不到故障！
+  * 如果主模型已经向前端吐了一半汉字（`yielded_any == True`）才断连 $\rightarrow$ **绝对不能静默切备模型接着拼接胡言乱语**，必须显式抛异常交由上层处理！
+
+---
+
+### 模块 3：上下文硬隔离与防提权子代理（`pyharness/runtime/subagents.py`）
+
+灵感源自 DSH `ctx.subagents`，解决“单 Agent 上下文被几十条检索和 SQL 中间输出塞爆”的难题：
+
+#### 1. 两个内置专家 Profile（`DEFAULT_SUBAGENT_PROFILES`）
+* **`researcher`**：只读企业知识与工单调查专家（工具白名单仅 `rag_search`, `mcp_list_incidents`，`model_tier="fast"`，`allow_high_risk=False`）。
+* **`analyst`**：结构化 SQL 与 Python 统计计算专家（工具白名单仅 `inspect_sql_schema`, `query_sql_readonly`, `run_python_sandbox`）。
+* 主协调者通过调用 `delegate_subagent` 委派子任务，子代理在**独立的子会话上下文**中完成多步探索，最后**只把精炼后的结构化摘要 JSON 返回给主代理**，主代理上下文瞬间瘦身 80%！支持 `one_shot`（一次性子任务）与 `continuable`（可续聊多轮子会话）。
+
+#### 2. 四道防递归与防越权铁锁（面试红队攻防必讲！看 `subagents.py` 第 217–258 行）
+1. **递归深度硬封顶**：通过 `ContextVar` 追踪 `_subagent_depth`，达到 `max_depth=2` 直接拒绝委派并从工具列表中剥离 `delegate_subagent`，杜绝“子调孙、孙调曾孙”无限套娃！
+2. **高危工具默认剥离**：除非 Profile 显式设置 `allow_high_risk=True`，否则子代理一律过滤掉所有 `RiskLevel.HIGH` 工具（防止通过委派绕过高危风控）。
+3. **父子权限交集（Intersection）**：如果父会话本身只允许部分工具，子代理有效工具集必须与父级取**交集**，严禁“低权限父代理借高权限子代理提权”！
+4. **治理与取消全继承**：通过 `bind_parent_context()` 经由 `ContextVar` 自动继承父级的 `Principal`（租户/角色）、`PolicyEngine`（ACP 策略）、`GuardrailHook`（DLP 脱敏）、`TelemetryRecorder` 以及 **`CancellationToken`**（父会话一点停止，所有运行中的子代理毫秒级联取消！）。
+
+---
+
+### 模块 4：核心执行引擎与治理升级（`engine.py` & `governance.py`）
+
+1. **真增量流式输出（`stream=True`）**：升级后的 `llm_client.py` 与 `engine.py` 原生支持从 OpenAI-Compatible SSE 流逐片解析 `delta.content`、`delta.reasoning_content` 以及分片拼接 `delta.tool_calls` JSON 参数，首字延迟（TTFT）从数秒降至几百毫秒！
+2. **防劈裂上下文增量压缩（`ContextCompressor`）**：
+   * 截断历史前循环检查 `while split_at > 0 and body[split_at].role == "tool": split_at -= 1`，**保证绝不把 `assistant(tool_calls)` 折叠进摘要而留下孤立的 `tool` 消息**（否则下游 LLM API 必报 400！）。
+   * 既支持确定性零成本规则折叠，也支持挂载 `fast` 档轻量 LLM 生成语义摘要。
+3. **四眼原则（Separation of Duties, SoD）防自审批**：
+   * 在新版 `ApprovalBroker` 中，待审批请求强制绑定 `requester_id` 与 `tenant_id`。
+   * 审批时后端从加密鉴权后的 `Principal` 提取真实审批人（**绝不信任前端 JSON 传入的 `reviewer` 字符串！**）：① 同一个人自提自批 $\rightarrow$ `403`；② 跨租户审批 $\rightarrow$ `403`；③ 缺少策略要求角色（如 `approver`/`admin`）$\rightarrow$ `403`！
+
+---
+
+## 三、 本阶段上海一面高频深挖 8 题
+
+1. **Q：为什么用 `ContextVar` 传递 `Principal`、子代理深度和取消令牌，而不用全局变量或给每个函数加 10 个参数？**
+   * *答*：Python `asyncio` 是单线程协程并发，全局变量会在不同用户请求之间互相串味造成严重越权事故；`ContextVar` 天生按协程任务隔离并自动随 `asyncio.create_task` 向下继承，既保证了高并发多租户零串数据，又让工具函数签名保持极其干净。
+2. **Q：PostgreSQL 存储 Event Journal 时，两个 Pod 同时向同一个 `session_id` 写事件导致 `seq` 冲突怎么解决？**
+   * *答*：使用事务级建议锁 `pg_advisory_xact_lock(hashtext(session_id))` 按会话粒度串行化写入——不同会话之间 100% 并发无锁竞争，同一会话内部严格保证 `seq` 单调递增和 SHA-256 `prev_hash` 不断链。
+3. **Q：主模型流式输出一半突然网络断开，ModelRouter 能不能自动切换备用模型续写？**
+   * *答*：不能！`model_router.py` 用 `yielded_any` 标志位精确区分：首字未出前静默故障转移；已吐出部分 Token 后直接上抛错误，防止两个模型拼接出语义错乱或数字自相矛盾的脏内容。
+4. **Q：子代理委派（Subagent）最容易出现哪两种安全漏洞？你的代码怎么防的？**
+   * *答*：① **无限递归烧钱** $\rightarrow$ `ContextVar` 追踪深度 + 达上限剥离 `delegate_subagent`；② **权限逃逸提权** $\rightarrow$ 子代理强制继承父级 `Principal` / `PolicyEngine` / `GuardrailHook`、有效工具集取父子交集、默认剥离一切 `HIGH` 风险工具。
+5. **Q：为什么 Event Journal 要做 SHA-256 哈希链？直接存数据库日志不够吗？**
+   * *答*：金融/能源/大型零售等强合规企业要求日志**不可抵赖、防内部篡改**。哈希链把每条事件的 `tenant_id`、`user_id`、`payload` 与前序哈希绑定，任何事后改库或删行都会在 `/audit/verify` 验签时精确暴露到具体的 `broken_at_seq`。
+6. **Q：上下文压缩为什么必须防劈裂 `tool_call` 和 `tool` 消息对？**
+   * *答*：OpenAI/DeepSeek/Qwen 协议强制校验每条 `role="tool"` 的 `tool_call_id` 必须紧跟前序 `assistant.tool_calls`，硬切会导致整个会话后续永久报 `400 Bad Request` 瘫痪。
+7. **Q：如何防止用户伪造 JSON 中的 `reviewer: "admin"` 绕过四眼审批？**
+   * *答*：审批接口强制走 `AuthManager` 验签拿到可信 `Principal`，完全忽略请求体中不可信的 `reviewer` 字段，用密码学验证过的 `principal.user_id` 校验 `requester_id != principal.user_id` 且同租户且具 `approver/admin` 角色。
+8. **Q：并发工具调用时怎么防止把下游数据库打挂？**
+   * *答*：`asyncio.gather` 外套 `asyncio.Semaphore(max_parallel_tools)` 限流，同步阻塞函数通过 `inspect.iscoroutinefunction` 自动分流至 `asyncio.to_thread` 避免卡死事件循环。

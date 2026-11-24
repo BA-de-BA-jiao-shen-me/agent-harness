@@ -11,9 +11,11 @@ from typing import Any
 import httpx
 
 from pyharness.rag.chunker import ChildChunk, HierarchicalChunker, ParentChunk
+from pyharness.rag.qdrant_store import BaseVectorStore
 from pyharness.rag.query_rewriter import QueryRewriter
 from pyharness.runtime.engine import ToolRegistry
 from pyharness.runtime.schemas import Message, RiskLevel, ToolSpec
+from pyharness.security.auth import current_principal
 
 
 def tokenize_mixed(text: str) -> list[str]:
@@ -24,9 +26,7 @@ def tokenize_mixed(text: str) -> list[str]:
     """
     text_lower = text.lower()
     tokens: list[str] = []
-    # English / numeric / hyphenated technical tokens
     tokens.extend(re.findall(r"[a-z0-9][a-z0-9_\-\.]*[a-z0-9]|[a-z0-9]", text_lower))
-    # Chinese character spans -> unigrams + bigrams
     for span in re.findall(r"[\u4e00-\u9fff]+", text_lower):
         for ch in span:
             tokens.append(ch)
@@ -35,38 +35,82 @@ def tokenize_mixed(text: str) -> list[str]:
     return tokens
 
 
+def _matches_filter(chunk: ChildChunk | None, metadata_filter: dict[str, Any] | None) -> bool:
+    if not metadata_filter:
+        return True
+    if chunk is None:
+        return False
+    for k, v in metadata_filter.items():
+        if k == "_acl_tenant":
+            doc_tenant = chunk.metadata.get("tenant_id")
+            is_public = chunk.metadata.get("visibility") == "public" or doc_tenant is None
+            if not is_public and doc_tenant != str(v):
+                return False
+            continue
+        if k == "doc_id" and chunk.doc_id != v:
+            return False
+        if k == "source" and chunk.source != v:
+            return False
+        if k not in {"doc_id", "source"} and chunk.metadata.get(k) != str(v):
+            return False
+    return True
+
+
 class BM25Index:
-    """Standard Okapi BM25 sparse lexical retriever (k1=1.5, b=0.75)."""
+    """Standard Okapi BM25 sparse lexical retriever (k1=1.5, b=0.75) supporting idempotent updates."""
 
     def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
         self.k1 = k1
         self.b = b
-        self._doc_ids: list[str] = []
-        self._doc_freqs: list[Counter[str]] = []
-        self._doc_lens: list[int] = []
+        self._docs: dict[str, tuple[Counter[str], int]] = {}
         self._df: Counter[str] = Counter()
         self._avgdl: float = 0.0
 
+    def _recompute_avgdl(self) -> None:
+        if not self._docs:
+            self._avgdl = 0.0
+        else:
+            self._avgdl = sum(dl for _, dl in self._docs.values()) / len(self._docs)
+
+    def remove_documents(self, doc_ids: list[str]) -> None:
+        removed = False
+        for did in doc_ids:
+            entry = self._docs.pop(did, None)
+            if entry is not None:
+                removed = True
+                tf, _ = entry
+                for term in tf:
+                    self._df[term] -= 1
+                    if self._df[term] <= 0:
+                        del self._df[term]
+        if removed:
+            self._recompute_avgdl()
+
     def add_documents(self, items: list[tuple[str, str]]) -> None:
+        # Ensure idempotent replacement if same chunk_id is re-added
+        self.remove_documents([doc_id for doc_id, _ in items if doc_id in self._docs])
         for doc_id, text in items:
             toks = tokenize_mixed(text)
             tf = Counter(toks)
-            self._doc_ids.append(doc_id)
-            self._doc_freqs.append(tf)
-            self._doc_lens.append(len(toks))
+            self._docs[doc_id] = (tf, len(toks))
             for term in tf:
                 self._df[term] += 1
-        self._avgdl = sum(self._doc_lens) / max(1, len(self._doc_lens))
+        self._recompute_avgdl()
 
-    def search(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
-        n_docs = len(self._doc_ids)
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        allowed_ids: set[str] | None = None,
+    ) -> list[tuple[str, float]]:
+        n_docs = len(self._docs)
         if n_docs == 0:
             return []
         q_tokens = tokenize_mixed(query)
         scores: list[tuple[str, float]] = []
-        for idx, doc_id in enumerate(self._doc_ids):
-            dl = self._doc_lens[idx]
-            tf_map = self._doc_freqs[idx]
+        for doc_id, (tf_map, dl) in self._docs.items():
+            if allowed_ids is not None and doc_id not in allowed_ids:
+                continue
             score = 0.0
             for term in q_tokens:
                 tf = tf_map.get(term, 0)
@@ -102,7 +146,6 @@ class HashingSemanticEmbedder(BaseEmbedder):
         for text in texts:
             vec = [0.0] * self.dim
             toks = tokenize_mixed(text)
-            # Add char trigrams for fuzzy semantic overlap
             clean = re.sub(r"\s+", "", text.lower())
             trigrams = [clean[i : i + 3] for i in range(max(0, len(clean) - 2))]
             for feat in toks + trigrams:
@@ -135,13 +178,18 @@ class OpenAICompatibleEmbedder(BaseEmbedder):
             return [item["embedding"] for item in sorted(data, key=lambda x: x["index"])]
 
 
-class DenseVectorIndex:
-    """In-memory cosine similarity vector store (easily swappable with Qdrant/Milvus)."""
+class DenseVectorIndex(BaseVectorStore):
+    """In-memory cosine similarity vector store implementing `BaseVectorStore`."""
 
     def __init__(self, embedder: BaseEmbedder | None = None) -> None:
         self.embedder = embedder or HashingSemanticEmbedder()
-        self._doc_ids: list[str] = []
-        self._vectors: list[list[float]] = []
+        self._vectors: dict[str, list[float]] = {}
+        self._chunks: dict[str, ChildChunk] = {}
+        self._parents: dict[str, ParentChunk] = {}
+
+    @property
+    def store_name(self) -> str:
+        return "memory"
 
     @staticmethod
     def _cosine(a: list[float], b: list[float]) -> float:
@@ -155,19 +203,50 @@ class DenseVectorIndex:
             return
         vecs = await self.embedder.embed([txt for _, txt in items])
         for (doc_id, _), vec in zip(items, vecs):
-            self._doc_ids.append(doc_id)
-            self._vectors.append(vec)
+            self._vectors[doc_id] = vec
 
-    async def search(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
-        if not self._doc_ids:
+    async def upsert_chunks(
+        self,
+        chunks: list[ChildChunk],
+        parent_map: dict[str, ParentChunk],
+    ) -> None:
+        if not chunks:
+            return
+        vecs = await self.embedder.embed([c.content for c in chunks])
+        for chunk, vec in zip(chunks, vecs):
+            self._vectors[chunk.chunk_id] = vec
+            self._chunks[chunk.chunk_id] = chunk
+            if chunk.parent_id in parent_map:
+                self._parents[chunk.parent_id] = parent_map[chunk.parent_id]
+
+    async def delete_by_doc_id(self, doc_id: str) -> None:
+        to_del = [cid for cid, c in self._chunks.items() if c.doc_id == doc_id]
+        for cid in to_del:
+            self._chunks.pop(cid, None)
+            self._vectors.pop(cid, None)
+        parent_del = [pid for pid, p in self._parents.items() if p.doc_id == doc_id]
+        for pid in parent_del:
+            self._parents.pop(pid, None)
+
+    async def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[tuple[str, float]]:
+        if not self._vectors:
             return []
         q_vec = (await self.embedder.embed([query]))[0]
-        scored = [
-            (doc_id, self._cosine(q_vec, vec))
-            for doc_id, vec in zip(self._doc_ids, self._vectors)
-        ]
+        scored: list[tuple[str, float]] = []
+        for cid, vec in self._vectors.items():
+            if metadata_filter and not _matches_filter(self._chunks.get(cid), metadata_filter):
+                continue
+            scored.append((cid, self._cosine(q_vec, vec)))
         scored.sort(key=lambda x: -x[1])
         return scored[:top_k]
+
+    async def load_persisted_chunks(self) -> tuple[dict[str, ParentChunk], dict[str, ChildChunk]]:
+        return dict(self._parents), dict(self._chunks)
 
 
 class BaseReranker(ABC):
@@ -179,10 +258,7 @@ class BaseReranker(ABC):
 
 
 class LexicalSemanticReranker(BaseReranker):
-    """
-    Lightweight Cross-Encoder-style pair scorer for offline/CI execution:
-    combines exact query bigram coverage, phrase proximity, and section heading match.
-    """
+    """Lightweight Cross-Encoder-style pair scorer for offline/CI execution."""
 
     async def rerank(
         self, query: str, candidates: list[tuple[str, str]], top_k: int
@@ -239,11 +315,7 @@ def reciprocal_rank_fusion(
     ranked_lists: list[list[tuple[str, float]]],
     k: int = 60,
 ) -> list[tuple[str, float]]:
-    """
-    Scale-invariant Reciprocal Rank Fusion:
-        RRF(d) = sum_i 1 / (k + rank_i(d))
-    Eliminates fragile manual score normalization between dense cosine [0,1] and unbounded BM25 scores.
-    """
+    """Scale-invariant Reciprocal Rank Fusion: RRF(d) = sum_i 1 / (k + rank_i(d))."""
     fused: dict[str, float] = {}
     for rlist in ranked_lists:
         for rank, (doc_id, _score) in enumerate(rlist, start=1):
@@ -268,7 +340,8 @@ class RetrievalHit:
 class HybridRAGPipeline:
     """
     End-to-end Enterprise Hybrid RAG Pipeline:
-    Ingest (Hierarchical Table-Aware Parent-Child) -> Query Rewrite -> BM25 + Dense -> RRF -> Cross-Encoder Rerank -> Parent Context & Citations.
+    Ingest (Hierarchical Table-Aware Parent-Child) -> BM25 + VectorStore (Memory or Qdrant)
+    -> RRF -> Cross-Encoder Rerank -> Metadata/ACL Filter -> Parent Context & Citations.
     """
 
     def __init__(
@@ -277,25 +350,61 @@ class HybridRAGPipeline:
         reranker: BaseReranker | None = None,
         rewriter: QueryRewriter | None = None,
         chunker: HierarchicalChunker | None = None,
+        vector_store: BaseVectorStore | None = None,
     ) -> None:
         self.chunker = chunker or HierarchicalChunker()
         self.rewriter = rewriter or QueryRewriter()
         self.bm25 = BM25Index()
-        self.dense = DenseVectorIndex(embedder=embedder)
+        self.dense: BaseVectorStore = vector_store or DenseVectorIndex(embedder=embedder)
         self.reranker = reranker or LexicalSemanticReranker()
         self._parents: dict[str, ParentChunk] = {}
         self._children: dict[str, ChildChunk] = {}
 
-    async def ingest_markdown(self, text: str, source: str, doc_id: str | None = None) -> dict[str, int]:
+    async def restore_from_store(self) -> dict[str, int]:
+        """Hydrate in-memory BM25 lexical index and Parent/Child maps from persistent VectorStore (e.g. Qdrant)."""
+        parents, children = await self.dense.load_persisted_chunks()
+        self._parents.update(parents)
+        self._children.update(children)
+        if children:
+            self.bm25.add_documents([(cid, c.content) for cid, c in children.items()])
+        return {"parents_restored": len(parents), "children_restored": len(children)}
+
+    async def ingest_markdown(
+        self,
+        text: str,
+        source: str,
+        doc_id: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> dict[str, int]:
         parents, children = self.chunker.chunk_document(text=text, source=source, doc_id=doc_id)
+        if not children:
+            return {"parents_indexed": 0, "children_indexed": 0}
+
+        actual_doc_id = children[0].doc_id
+        # Idempotently purge any prior version of this doc_id before re-indexing
+        stale_cids = [cid for cid, c in self._children.items() if c.doc_id == actual_doc_id]
+        if stale_cids:
+            self.bm25.remove_documents(stale_cids)
+            for cid in stale_cids:
+                self._children.pop(cid, None)
+            for pid in [pid for pid, p in self._parents.items() if p.doc_id == actual_doc_id]:
+                self._parents.pop(pid, None)
+            await self.dense.delete_by_doc_id(actual_doc_id)
+
+        parent_batch: dict[str, ParentChunk] = {}
         for p in parents:
             self._parents[p.parent_id] = p
+            parent_batch[p.parent_id] = p
+
         items: list[tuple[str, str]] = []
         for c in children:
+            if metadata:
+                c.metadata.update({k: str(v) for k, v in metadata.items()})
             self._children[c.chunk_id] = c
             items.append((c.chunk_id, c.content))
+
         self.bm25.add_documents(items)
-        await self.dense.add_documents(items)
+        await self.dense.upsert_chunks(children, parent_batch)
         return {"parents_indexed": len(parents), "children_indexed": len(children)}
 
     async def search(
@@ -304,16 +413,25 @@ class HybridRAGPipeline:
         top_k: int = 3,
         mode: str = "hybrid_rerank",  # "dense" | "bm25" | "hybrid" | "hybrid_rerank"
         recent_history: list[Message] | None = None,
+        metadata_filter: dict[str, Any] | None = None,
     ) -> list[RetrievalHit]:
         rq = await self.rewriter.rewrite(query, recent_history=recent_history)
         recall_k = max(top_k * 4, 12)
 
+        allowed_ids: set[str] | None = None
+        if metadata_filter:
+            allowed_ids = {
+                cid for cid, c in self._children.items() if _matches_filter(c, metadata_filter)
+            }
+
         ranked_lists: list[list[tuple[str, float]]] = []
         for sq in rq.sub_queries:
             if mode in ("bm25", "hybrid", "hybrid_rerank"):
-                ranked_lists.append(self.bm25.search(sq, top_k=recall_k))
+                ranked_lists.append(self.bm25.search(sq, top_k=recall_k, allowed_ids=allowed_ids))
             if mode in ("dense", "hybrid", "hybrid_rerank"):
-                ranked_lists.append(await self.dense.search(sq, top_k=recall_k))
+                ranked_lists.append(
+                    await self.dense.search(sq, top_k=recall_k, metadata_filter=metadata_filter)
+                )
 
         if len(ranked_lists) == 1:
             merged = ranked_lists[0]
@@ -321,10 +439,14 @@ class HybridRAGPipeline:
             merged = reciprocal_rank_fusion(ranked_lists, k=60)
 
         if mode == "hybrid_rerank" and merged:
-            cand_pairs = [(cid, self._children[cid].content) for cid, _ in merged[:recall_k] if cid in self._children]
+            cand_pairs = [
+                (cid, self._children[cid].content)
+                for cid, _ in merged[:recall_k]
+                if cid in self._children
+            ]
             final_ranked = await self.reranker.rerank(rq.rewritten, cand_pairs, top_k=top_k)
         else:
-            final_ranked = merged[:top_k]
+            final_ranked = [(cid, sc) for cid, sc in merged if cid in self._children][:top_k]
 
         hits: list[RetrievalHit] = []
         for idx, (cid, score) in enumerate(final_ranked, start=1):
@@ -345,7 +467,16 @@ class HybridRAGPipeline:
         return hits
 
     async def search_as_tool(self, query: str, top_k: int = 3) -> str:
-        hits = await self.search(query=query, top_k=top_k, mode="hybrid_rerank")
+        principal = current_principal.get()
+        acl_filter: dict[str, Any] | None = None
+        if principal is not None and not principal.is_admin:
+            acl_filter = {"_acl_tenant": principal.tenant_id}
+        hits = await self.search(
+            query=query,
+            top_k=top_k,
+            mode="hybrid_rerank",
+            metadata_filter=acl_filter,
+        )
         payload = [
             {
                 "citation": f"[{h.citation_id}]",
@@ -357,6 +488,9 @@ class HybridRAGPipeline:
             for h in hits
         ]
         return json.dumps(payload, ensure_ascii=False)
+
+    async def aclose(self) -> None:
+        await self.dense.aclose()
 
     def register_tools(self, registry: ToolRegistry) -> None:
         registry.register(

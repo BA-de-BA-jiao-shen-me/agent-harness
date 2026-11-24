@@ -9,12 +9,51 @@ services:
       - path: .env
         required: false
     environment:
-      HARNESS_JOURNAL_DB: /app/data/event_journal.sqlite3
+      HARNESS_PROFILE: enterprise
+      HARNESS_AUTH_MODE: enforce
+      HARNESS_APPROVAL_ALLOW_SELF: "false"
+      HARNESS_CORS_ORIGINS: http://localhost:3000
+      HARNESS_POLICY_FILE: /app/policies/enterprise_policy.yaml
+      DATABASE_URL: postgresql://pyharness:pyharness_secret@postgres:5432/pyharness
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: pyharness_chunks
+      HARNESS_SANDBOX_PROVIDER: docker
+      DOCKER_HOST: tcp://docker-proxy:2375
+      DOCKER_SANDBOX_IMAGE: python:3.11-slim
     volumes:
       - harness_data:/app/data
     depends_on:
+      - postgres
       - redis
       - qdrant
+      - docker-proxy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pyharness
+      POSTGRES_PASSWORD: pyharness_secret
+      POSTGRES_DB: pyharness
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Least-privilege Docker Engine API proxy so `api` runs as non-root `appuser`
+  # and cannot mount host volumes or start privileged/host-network containers.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      POST: 1
+      PRIVILEGED: 0
+      VOLUMES: 0
+      HOST: 0
+      NETWORKS: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
   web:
     build:
@@ -39,4 +78,5 @@ services:
 
 volumes:
   harness_data:
+  postgres_data:
   qdrant_data:
