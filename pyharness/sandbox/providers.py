@@ -472,7 +472,13 @@ def create_sandbox_provider(
         return E2BSandboxProvider(api_key=resolved_e2b_key, api_url=resolved_e2b_url)
 
     if normalized == "docker":
-        if not resolved_docker_host and not Path("/var/run/docker.sock").exists():
+        if resolved_docker_host.startswith("unix://"):
+            uds_candidate = resolved_docker_host.removeprefix("unix://")
+            if not Path(uds_candidate).exists():
+                raise SandboxConfigurationError(
+                    f"HARNESS_SANDBOX_PROVIDER='docker' requested, but Docker socket '{uds_candidate}' does not exist (fail-closed)."
+                )
+        elif not resolved_docker_host and not Path("/var/run/docker.sock").exists():
             raise SandboxConfigurationError(
                 "HARNESS_SANDBOX_PROVIDER='docker' requested, but neither DOCKER_HOST nor "
                 "/var/run/docker.sock is available (fail-closed)."

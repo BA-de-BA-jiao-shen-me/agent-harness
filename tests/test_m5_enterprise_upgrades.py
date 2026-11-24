@@ -134,11 +134,11 @@ async def test_docker_sandbox_provider_enforces_hardened_container_spec_and_forc
 
 
 async def test_e2b_microvm_provider_and_fail_closed_factory() -> None:
-    # Explicit docker/e2b without credentials/daemon must fail closed!
+    # Explicit docker/e2b without credentials/daemon must fail closed on both Windows and Linux!
     with pytest.raises(SandboxConfigurationError):
         create_sandbox_provider("e2b", e2b_api_key="")
     with pytest.raises(SandboxConfigurationError):
-        create_sandbox_provider("docker", docker_host="")
+        create_sandbox_provider("docker", docker_host="unix:///nonexistent/pyharness_missing.sock")
 
     lifecycle_calls: list[str] = []
 
