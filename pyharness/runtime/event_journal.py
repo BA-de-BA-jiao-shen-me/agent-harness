@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from pyharness.runtime.journal_store import (
     AuditVerificationResult,
+    BranchInfo,
     JournalStorageBackend,
     PostgresJournalStore,
     SQLiteJournalStore,
     SessionRecord,
+    SessionTreeResult,
     create_journal_store,
 )
 from pyharness.runtime.schemas import EventType, HarnessEvent, Message
@@ -65,6 +67,8 @@ class EventJournal:
             user_id=str(row.get("user_id") or "anonymous"),
             prev_hash=str(row.get("prev_hash") or ""),
             event_hash=str(row.get("event_hash") or ""),
+            parent_event_id=row.get("parent_event_id"),
+            branch_name=str(row.get("branch_name") or "main"),
         )
 
     @staticmethod
@@ -118,6 +122,8 @@ class EventJournal:
         payload: dict[str, Any] | None = None,
         tenant_id: str | None = None,
         user_id: str | None = None,
+        branch_name: str | None = None,
+        parent_event_id: str | None = None,
     ) -> HarnessEvent:
         """Persist hash-chained event and fan out to local + distributed subscribers."""
         principal = current_principal.get()
@@ -131,6 +137,8 @@ class EventJournal:
             payload=payload or {},
             tenant_id=eff_tenant,
             user_id=eff_user,
+            branch_name=branch_name,
+            parent_event_id=parent_event_id,
         )
         event = self._dict_to_event(row)
 
@@ -196,6 +204,49 @@ class EventJournal:
             tenant_id=eff_tenant,
             owner_user_id=eff_owner,
         )
+
+    async def create_branch(
+        self,
+        session_id: str,
+        branch_name: str,
+        from_event_id: str | None = None,
+        *,
+        switch: bool = True,
+    ) -> BranchInfo:
+        """Create a zero-copy in-place branch inside `session_id`."""
+        return await self.store.create_branch(
+            session_id=session_id,
+            branch_name=branch_name,
+            from_event_id=from_event_id,
+            switch=switch,
+        )
+
+    async def switch_branch(
+        self,
+        session_id: str,
+        branch_name: str,
+    ) -> BranchInfo:
+        """Switch the active branch pointer for `session_id`."""
+        return await self.store.switch_branch(
+            session_id=session_id,
+            branch_name=branch_name,
+        )
+
+    async def get_branch_events(
+        self,
+        session_id: str,
+        branch_name: str | None = None,
+    ) -> list[HarnessEvent]:
+        """Return chronological root-to-leaf events along a branch lineage."""
+        rows = await self.store.get_branch_events(
+            session_id=session_id,
+            branch_name=branch_name,
+        )
+        return [self._dict_to_event(r) for r in rows]
+
+    async def get_session_tree(self, session_id: str) -> SessionTreeResult:
+        """Return full branch metadata and DAG node topology for `session_id`."""
+        return await self.store.get_session_tree(session_id=session_id)
 
     async def stream_live_events(
         self,
@@ -297,9 +348,29 @@ class EventJournal:
     ) -> list[Message] | None:
         if not events:
             return None
+
         messages: list[Message] = [Message(role="system", content=default_system_prompt)]
+
+        anchor_idx: int | None = None
+        for idx in range(len(events) - 1, -1, -1):
+            if events[idx].event_type == EventType.COMPACTION_ANCHOR:
+                anchor_idx = idx
+                break
+
+        if anchor_idx is not None:
+            anchor_summary = str(events[anchor_idx].payload.get("summary") or "").strip()
+            if anchor_summary:
+                if anchor_summary.startswith("[Incremental Context Summary]"):
+                    summary_content = anchor_summary
+                else:
+                    summary_content = f"[Incremental Context Summary]\n{anchor_summary}"
+                messages.append(Message(role="system", content=summary_content))
+            effective_events = events[anchor_idx + 1 :]
+        else:
+            effective_events = events
+
         turn_buffers: dict[str, list[str]] = {}
-        for ev in events:
+        for ev in effective_events:
             if ev.event_type == EventType.TURN_START:
                 user_in = str(ev.payload.get("user_input") or "")
                 if user_in:
@@ -308,6 +379,13 @@ class EventJournal:
             elif ev.event_type == EventType.TOKEN_DELTA:
                 chunk = str(ev.payload.get("content") or "")
                 turn_buffers.setdefault(ev.turn_id, []).append(chunk)
+            elif ev.event_type in (EventType.TURN_STEERED, EventType.FOLLOWUP_ENQUEUED):
+                steer_text = str(ev.payload.get("content") or "")
+                if steer_text.strip():
+                    pending = "".join(turn_buffers.pop(ev.turn_id, []))
+                    if pending:
+                        messages.append(Message(role="assistant", content=pending))
+                    messages.append(Message(role="user", content=steer_text))
             elif ev.event_type == EventType.TURN_COMPLETE:
                 assembled = "".join(turn_buffers.pop(ev.turn_id, []))
                 if assembled:
@@ -324,13 +402,27 @@ class EventJournal:
             self.replay_session(session_id), default_system_prompt
         )
 
+    async def areconstruct_branch_messages(
+        self,
+        session_id: str,
+        default_system_prompt: str,
+        branch_name: str | None = None,
+    ) -> list[Message] | None:
+        """Reconstruct dialogue history for a specific (or active) branch asynchronously."""
+        events = await self.get_branch_events(session_id, branch_name=branch_name)
+        return self._build_messages_from_events(events, default_system_prompt)
+
     async def areconstruct_messages(
         self,
         session_id: str,
         default_system_prompt: str,
     ) -> list[Message] | None:
         """Reconstruct dialogue history asynchronously (SQLite WAL & PostgreSQL)."""
-        events = await self.areplay_session(session_id)
+        tree = await self.get_session_tree(session_id)
+        if len(tree.branches) > 1 or tree.active_branch != "main":
+            events = await self.get_branch_events(session_id)
+        else:
+            events = await self.areplay_session(session_id)
         return self._build_messages_from_events(events, default_system_prompt)
 
     def _summarize_events(
@@ -405,9 +497,11 @@ class EventJournal:
 
 __all__ = [
     "AuditVerificationResult",
+    "BranchInfo",
     "EventJournal",
     "JournalStorageBackend",
     "PostgresJournalStore",
     "SQLiteJournalStore",
     "SessionRecord",
+    "SessionTreeResult",
 ]

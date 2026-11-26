@@ -5,16 +5,26 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator
+from dataclasses import asdict
+from typing import Any, AsyncGenerator, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from pyharness.api.deps import DEFAULT_SYSTEM_PROMPT, RuntimeContainer
-from pyharness.runtime.governance import ApprovalAuthorizationError, CancellationToken
-from pyharness.runtime.schemas import EventType
+from pyharness.runtime import (
+    AdmissionRejectedError,
+    ApprovalAuthorizationError,
+    ArtifactAuthorizationError,
+    CancellationToken,
+    EventType,
+    ModelRouterLLMClient,
+    QuestionAuthorizationError,
+    ScheduledTaskSpec,
+    TopicBlockedError,
+)
 from pyharness.security import (
     AuthenticationError,
     Principal,
@@ -26,6 +36,41 @@ from pyharness.security import (
 class ChatRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     message: str = Field(..., min_length=1)
+    queue_mode: Literal["reject", "steer", "followup"] = "reject"
+    timezone: str | None = None
+    project_id: str | None = None
+    branch_name: str | None = None
+
+
+class SteeringInputRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+
+class QuestionAnswerRequest(BaseModel):
+    selected_options: list[str] = Field(default_factory=list)
+    free_text: str = ""
+
+
+class BranchCreateRequest(BaseModel):
+    branch_name: str = Field(..., min_length=1)
+    from_event_id: str | None = None
+    switch: bool = True
+
+
+class MemoryCreateRequest(BaseModel):
+    content: str = Field(..., min_length=1)
+    project_id: str = "default"
+    scope: Literal["project", "global"] = "project"
+    category: str = "fact"
+    tags: list[str] = Field(default_factory=list)
+
+
+class ScheduledTaskCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    prompt: str = Field(..., min_length=1)
+    interval_seconds: float | None = None
+    cron_expr: str | None = None
+    enabled: bool = True
 
 
 class ApprovalResolveRequest(BaseModel):
@@ -75,11 +120,13 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
 
     app = FastAPI(
         title="PyHarness Enterprise Agent API",
-        version="0.3.0",
+        version="0.4.0",
         description=(
-            "Enterprise DSH-Grade Agent Harness Control Plane with JWT/RBAC, Four-Eyes SoD Approvals, "
-            "Dynamic ACP Policy Engine, DLP/Injection Guardrails, Cordis Plugin Kernel, Subagents, "
-            "Tamper-Evident Audit Hash Chain, Pluggable Sandboxes, Redis & Qdrant."
+            "Enterprise DSH-Grade Agent Harness Control Plane (v0.4.0) with Prefix-Cache-Optimal "
+            "Context Engine, Tool Output Offloading (Memory/File/S3), Mid-Turn Steer/Follow-up, "
+            "Interactive Clarification, In-Place Session Tree, Project Memory, Trusted Clock, "
+            "Zero-Trust Credential Relay, Admission & Idle Reaper, Weighted Model Routing, "
+            "JWT/RBAC, Four-Eyes SoD Approvals, Dynamic ACP, and SHA-256 Audit Hash Chain."
         ),
         lifespan=lifespan,
     )
@@ -126,13 +173,16 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {
+        readiness = [asdict(r) for r in rt.skill_router.check_readiness(rt.tools)]
+        resp: dict[str, Any] = {
             "status": "ok",
+            "version": "0.4.0",
             "profile": rt.profile,
             "auth_mode": rt.auth_manager.mode,
             "enforce_four_eyes": rt.approval_broker.enforce_four_eyes,
             "mounted_plugins": rt.plugin_context.mounted_plugins(),
             "journal_backend": rt.journal.backend_name,
+            "artifact_store": rt.artifact_store.store_name,
             "sandbox_provider": rt.python_sandbox.provider.provider_name,
             "coordination_backend": rt.coordination.backend_name,
             "vector_store": rt.rag.dense.store_name,
@@ -140,7 +190,14 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
             "subagent_profiles": [p.name for p in rt.subagent_manager.list_profiles()],
             "tools_loaded": [t.name for t in rt.tools.list_specs()],
             "skills_loaded": [s.name for s in rt.skill_router.list_skills()],
+            "skill_readiness": readiness,
+            "admission_stats": rt.admission_controller.stats(),
+            "scheduled_tasks_count": len(rt.scheduler.list_tasks()),
+            "credential_targets_count": len(rt.credential_relay.list_targets()),
         }
+        if isinstance(rt.llm, ModelRouterLLMClient):
+            resp["model_routes"] = rt.llm.route_health()
+        return resp
 
     @app.get("/metrics", response_class=PlainTextResponse)
     async def prometheus_metrics() -> PlainTextResponse:
@@ -153,15 +210,31 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
     async def chat_stream(
         req: ChatRequest,
         principal: Principal = Depends(require_principal),
-    ) -> StreamingResponse:
+    ):
         """
         Streamable HTTP / SSE endpoint emitting real-time Harness events with AuthN/RBAC,
-        FinOps RPM/Budget guard, ACP policy enforcement, DLP guardrails, and session locking.
+        Topic Guard, Concurrency Admission, FinOps RPM/Budget guard, ACP policy enforcement,
+        DLP guardrails, Prefix-Cache-Optimal context, and session locking/steering.
         """
         await rt.startup()
         await assert_session_access(req.session_id, principal, allow_missing=True)
 
-        # Enterprise FinOps rate-limit & daily token/USD budget check
+        # 1. Pre-turn Topic Admission Guard (blocks/redirects out-of-scope prompts before spending tokens)
+        try:
+            rt.topic_guard.enforce(req.message, tenant_id=principal.tenant_id)
+        except TopicBlockedError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "topic_blocked",
+                    "rule_id": exc.rule_id,
+                    "action": exc.action,
+                    "reason": exc.reason,
+                    "redirect_message": exc.redirect_message,
+                },
+            ) from exc
+
+        # 2. Enterprise FinOps rate-limit & daily token/USD budget check
         try:
             await rt.quota_manager.check_before_turn(principal)
         except QuotaExceededError as exc:
@@ -171,21 +244,72 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             ) from exc
 
+        # 3. Per-session exclusivity lock with optional Pi-style steer/followup queue modes
         lock_cm = rt.coordination.session_lock(req.session_id)
         acquired = await lock_cm.__aenter__()
         if not acquired:
             await lock_cm.__aexit__(None, None, None)
+            if req.queue_mode == "steer":
+                queued = rt.steering_queue.enqueue_steer(
+                    req.session_id,
+                    req.message,
+                    user_id=principal.user_id,
+                    tenant_id=principal.tenant_id,
+                )
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "queued": True,
+                        "mode": "steer",
+                        "message_id": queued.message_id,
+                        "session_id": req.session_id,
+                    },
+                )
+            if req.queue_mode == "followup":
+                queued = rt.steering_queue.enqueue_followup(
+                    req.session_id,
+                    req.message,
+                    user_id=principal.user_id,
+                    tenant_id=principal.tenant_id,
+                )
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "queued": True,
+                        "mode": "followup",
+                        "message_id": queued.message_id,
+                        "session_id": req.session_id,
+                    },
+                )
             raise HTTPException(
                 status_code=409,
                 detail=f"Session '{req.session_id}' already has an active turn running.",
             )
+
+        # 4. Global & per-tenant concurrency admission control (fail-fast HTTP 503)
+        try:
+            await rt.admission_controller.acquire(req.session_id, tenant_id=principal.tenant_id)
+        except AdmissionRejectedError as exc:
+            await lock_cm.__aexit__(None, None, None)
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=exc.reason,
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
 
         await rt.journal.ensure_session(
             req.session_id,
             tenant_id=principal.tenant_id,
             owner_user_id=principal.user_id,
         )
+        if req.branch_name:
+            try:
+                await rt.journal.switch_branch(req.session_id, req.branch_name)
+                rt.session_histories.pop(req.session_id, None)
+            except KeyError:
+                pass
 
+        rt.idle_reaper.touch(req.session_id)
         sub_queue = rt.journal.subscribe(req.session_id)
         cancel_token = CancellationToken()
         rt.active_cancellations[req.session_id] = cancel_token
@@ -206,9 +330,11 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
         )
 
         # Load durable session history from Redis/Coordination -> fallback to EventJournal
-        history = await rt.coordination.get_session_history(req.session_id)
-        if history is None:
-            history = rt.session_histories.get(req.session_id)
+        history = None
+        if not req.branch_name:
+            history = await rt.coordination.get_session_history(req.session_id)
+            if history is None:
+                history = rt.session_histories.get(req.session_id)
         if history is None:
             history = await rt.journal.areconstruct_messages(
                 req.session_id, DEFAULT_SYSTEM_PROMPT
@@ -225,8 +351,11 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
                         cancellation=cancel_token,
                         turn_system_instructions=turn_instructions,
                         allowed_tools=allowed_tools,
+                        timezone_name=req.timezone or "UTC",
+                        project_id=req.project_id,
                     )
                 rt.session_histories[req.session_id] = result.messages
+                rt.idle_reaper.touch(req.session_id)
                 await rt.coordination.save_session_history(req.session_id, result.messages)
                 if result.usage.total_tokens > 0 or result.usage.estimated_cost_usd > 0:
                     await rt.quota_manager.record_usage(
@@ -240,6 +369,7 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
                 remote_cancel_task.cancel()
                 rt.active_cancellations.pop(req.session_id, None)
                 await rt.coordination.unregister_active_session(req.session_id)
+                await rt.admission_controller.release(req.session_id, tenant_id=principal.tenant_id)
                 await lock_cm.__aexit__(None, None, None)
 
         agent_task = asyncio.create_task(_run_agent())
@@ -283,6 +413,346 @@ def create_app(container: RuntimeContainer | None = None) -> FastAPI:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @app.post("/api/v1/sessions/{session_id}/steer")
+    async def steer_session(
+        session_id: str,
+        body: SteeringInputRequest,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        """Inject a high-priority mid-turn steering directive into an active session (Pi pattern)."""
+        await rt.startup()
+        await assert_session_access(session_id, principal, allow_missing=True)
+        msg = rt.steering_queue.enqueue_steer(
+            session_id,
+            body.message,
+            user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+        )
+        return {
+            "session_id": session_id,
+            "queued": True,
+            "kind": "steer",
+            "message_id": msg.message_id,
+            "pending": rt.steering_queue.peek_counts(session_id),
+        }
+
+    @app.post("/api/v1/sessions/{session_id}/followup")
+    async def followup_session(
+        session_id: str,
+        body: SteeringInputRequest,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        """Enqueue a post-turn follow-up message to auto-execute after the current turn settles."""
+        await rt.startup()
+        await assert_session_access(session_id, principal, allow_missing=True)
+        msg = rt.steering_queue.enqueue_followup(
+            session_id,
+            body.message,
+            user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+        )
+        return {
+            "session_id": session_id,
+            "queued": True,
+            "kind": "followup",
+            "message_id": msg.message_id,
+            "pending": rt.steering_queue.peek_counts(session_id),
+        }
+
+    @app.get("/api/v1/sessions/{session_id}/questions")
+    async def list_session_questions(
+        session_id: str,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        await assert_session_access(session_id, principal)
+        pending = rt.question_broker.list_pending(
+            session_id=session_id,
+            tenant_id=principal.tenant_id,
+            is_admin=principal.is_admin,
+        )
+        return {"session_id": session_id, "pending": pending}
+
+    @app.post("/api/v1/sessions/{session_id}/questions/{question_id}/answer")
+    async def answer_session_question(
+        session_id: str,
+        question_id: str,
+        body: QuestionAnswerRequest,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        """Submit the session owner's answer to resume a paused `ask_user_question` tool call."""
+        await rt.startup()
+        await assert_session_access(session_id, principal)
+        try:
+            ok = rt.question_broker.submit_answer(
+                question_id,
+                selected_options=body.selected_options,
+                free_text=body.free_text,
+                principal=principal,
+            )
+        except QuestionAuthorizationError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        if not ok:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Pending question '{question_id}' not found or already resolved.",
+            )
+        return {
+            "session_id": session_id,
+            "question_id": question_id,
+            "answered": True,
+            "answered_by": principal.user_id,
+        }
+
+    @app.get("/api/v1/sessions/{session_id}/artifacts")
+    async def list_session_artifacts(
+        session_id: str,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        await assert_session_access(session_id, principal)
+        records = await rt.artifact_store.list_for_session(
+            session_id,
+            tenant_id=principal.tenant_id,
+            is_admin=principal.is_admin,
+        )
+        return {
+            "session_id": session_id,
+            "artifacts": [r.model_dump() for r in records],
+        }
+
+    @app.get("/api/v1/artifacts/{artifact_id}")
+    async def read_artifact_endpoint(
+        artifact_id: str,
+        offset: int = 0,
+        limit: int = 4000,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        try:
+            rec, chunk, has_more = await rt.artifact_store.read_slice(
+                artifact_id,
+                offset=offset,
+                limit=limit,
+                tenant_id=principal.tenant_id,
+                is_admin=principal.is_admin,
+            )
+        except ArtifactAuthorizationError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "artifact_id": rec.artifact_id,
+            "session_id": rec.session_id,
+            "tool_name": rec.tool_name,
+            "offset": max(0, int(offset)),
+            "limit": max(0, int(limit)),
+            "total_chars": rec.char_count,
+            "has_more": has_more,
+            "storage_uri": rec.storage_uri,
+            "content": chunk,
+        }
+
+    @app.get("/api/v1/sessions/{session_id}/tree")
+    async def get_session_tree_endpoint(
+        session_id: str,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        """Return the in-place tree topology and all branches for `session_id` (Pi Tree Session)."""
+        await rt.startup()
+        await assert_session_access(session_id, principal)
+        tree = await rt.journal.get_session_tree(session_id)
+        return tree.model_dump()
+
+    @app.post("/api/v1/sessions/{session_id}/branches")
+    async def create_session_branch_endpoint(
+        session_id: str,
+        body: BranchCreateRequest,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        """Create a zero-copy in-place branch anchored at `from_event_id` (or active head)."""
+        await rt.startup()
+        await assert_session_access(session_id, principal)
+        try:
+            branch = await rt.journal.create_branch(
+                session_id,
+                body.branch_name,
+                from_event_id=body.from_event_id,
+                switch=body.switch,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if body.switch:
+            reconstructed = await rt.journal.areconstruct_branch_messages(
+                session_id, DEFAULT_SYSTEM_PROMPT, branch_name=branch.branch_name
+            )
+            if reconstructed is not None:
+                rt.session_histories[session_id] = reconstructed
+                await rt.coordination.save_session_history(session_id, reconstructed)
+            else:
+                rt.session_histories.pop(session_id, None)
+        return branch.model_dump()
+
+    @app.post("/api/v1/sessions/{session_id}/branches/{branch_name}/switch")
+    async def switch_session_branch_endpoint(
+        session_id: str,
+        branch_name: str,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        """Switch active in-place branch and rebuild branch dialogue history projection."""
+        await rt.startup()
+        await assert_session_access(session_id, principal)
+        try:
+            branch = await rt.journal.switch_branch(session_id, branch_name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        reconstructed = await rt.journal.areconstruct_branch_messages(
+            session_id, DEFAULT_SYSTEM_PROMPT, branch_name=branch.branch_name
+        )
+        if reconstructed is not None:
+            rt.session_histories[session_id] = reconstructed
+            await rt.coordination.save_session_history(session_id, reconstructed)
+        else:
+            rt.session_histories.pop(session_id, None)
+        return branch.model_dump()
+
+    @app.get("/api/v1/memories")
+    async def list_memories_endpoint(
+        project_id: str | None = None,
+        query: str | None = None,
+        top_k: int = 10,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        if query:
+            items = await rt.memory_store.recall(
+                query,
+                tenant_id=principal.tenant_id,
+                user_id=principal.user_id,
+                project_id=project_id or "default",
+                top_k=top_k,
+            )
+        else:
+            items = await rt.memory_store.list_memories(
+                tenant_id=principal.tenant_id,
+                user_id=None if principal.is_admin else principal.user_id,
+                project_id=project_id,
+            )
+        return {"memories": [m.model_dump() for m in items]}
+
+    @app.post("/api/v1/memories")
+    async def create_memory_endpoint(
+        body: MemoryCreateRequest,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        entry = await rt.memory_store.save(
+            body.content,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            project_id=body.project_id,
+            scope=body.scope,
+            category=body.category,
+            tags=body.tags,
+        )
+        return entry.model_dump()
+
+    @app.delete("/api/v1/memories/{memory_id}")
+    async def delete_memory_endpoint(
+        memory_id: str,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        try:
+            deleted = await rt.memory_store.delete(
+                memory_id,
+                tenant_id=principal.tenant_id,
+                user_id=principal.user_id,
+                is_admin=principal.is_admin,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Memory '{memory_id}' not found.")
+        return {"memory_id": memory_id, "deleted": True}
+
+    @app.get("/api/v1/skills/readiness")
+    async def skills_readiness_endpoint(
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        reports = [asdict(r) for r in rt.skill_router.check_readiness(rt.tools)]
+        return {
+            "skills": reports,
+            "invocation_stats": rt.skill_router.get_invocation_stats(),
+        }
+
+    @app.get("/api/v1/tasks/scheduled")
+    async def list_scheduled_tasks(
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        tenant_scope = None if principal.is_admin else principal.tenant_id
+        tasks = [t.model_dump() for t in rt.scheduler.list_tasks(tenant_id=tenant_scope)]
+        runs = [r.model_dump() for r in rt.scheduler.list_runs(limit=20)]
+        return {"tasks": tasks, "recent_runs": runs}
+
+    @app.post("/api/v1/tasks/scheduled")
+    async def create_scheduled_task(
+        body: ScheduledTaskCreateRequest,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        spec = ScheduledTaskSpec(
+            name=body.name,
+            prompt=body.prompt,
+            interval_seconds=body.interval_seconds,
+            cron_expr=body.cron_expr,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            roles=sorted(principal.roles),
+            enabled=body.enabled,
+        )
+        try:
+            registered = rt.scheduler.register_task(spec)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return registered.model_dump()
+
+    @app.post("/api/v1/tasks/scheduled/{task_id}/run")
+    async def run_scheduled_task_now(
+        task_id: str,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        spec = rt.scheduler.get_task(task_id)
+        if spec is None:
+            raise HTTPException(status_code=404, detail=f"Scheduled task '{task_id}' not found.")
+        if not principal.is_admin and spec.tenant_id != principal.tenant_id:
+            raise HTTPException(status_code=403, detail="Cross-tenant task execution denied.")
+        run = await rt.scheduler.run_now(task_id)
+        return run.model_dump()
+
+    @app.delete("/api/v1/tasks/scheduled/{task_id}")
+    async def delete_scheduled_task(
+        task_id: str,
+        principal: Principal = Depends(require_principal),
+    ) -> dict[str, Any]:
+        await rt.startup()
+        spec = rt.scheduler.get_task(task_id)
+        if spec is None:
+            raise HTTPException(status_code=404, detail=f"Scheduled task '{task_id}' not found.")
+        if not principal.is_admin and spec.tenant_id != principal.tenant_id:
+            raise HTTPException(status_code=403, detail="Cross-tenant task deletion denied.")
+        rt.scheduler.delete_task(task_id)
+        return {"task_id": task_id, "deleted": True}
 
     @app.get("/api/v1/sessions/{session_id}/stream")
     async def reconnect_session_stream(

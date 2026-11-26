@@ -16,7 +16,18 @@ from pyharness.runtime.governance import (
     TokenBudgetGuard,
     TurnCancelledError,
 )
-from pyharness.runtime.llm_client import BaseLLMClient
+from pyharness.runtime.interaction import (
+    ActiveTurnContext,
+    TurnSteeringQueue,
+    use_turn_context,
+)
+from pyharness.runtime.llm_client import BaseLLMClient, _supports_kwarg
+from pyharness.runtime.memory import (
+    ProjectMemoryStore,
+    TrustedTemporalContext,
+    current_project_id,
+    use_project_id,
+)
 from pyharness.runtime.schemas import (
     EventType,
     HarnessHook,
@@ -61,7 +72,7 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def list_specs(self) -> list[ToolSpec]:
-        return [item.spec for item in self._tools.values()]
+        return sorted((item.spec for item in self._tools.values()), key=lambda s: s.name)
 
     @staticmethod
     def validate_arguments(spec: ToolSpec, arguments: dict[str, Any]) -> str | None:
@@ -95,6 +106,17 @@ class ToolRegistry:
         return None
 
 
+DEFAULT_META_TOOLS: frozenset[str] = frozenset(
+    {
+        "ask_user_question",
+        "read_artifact",
+        "list_artifacts",
+        "remember_fact",
+        "recall_memory",
+    }
+)
+
+
 @dataclass
 class HarnessConfig:
     max_steps: int = 10
@@ -105,6 +127,10 @@ class HarnessConfig:
     context_compress_threshold: int = 6000
     keep_recent_messages: int = 4
     enforce_skill_tool_scope: bool = True
+    preserve_prompt_cache: bool = True
+    enable_length_recovery: bool = True
+    max_length_recoveries: int = 1
+    always_allowed_meta_tools: frozenset[str] = DEFAULT_META_TOOLS
 
 
 class AgentHarnessEngine:
@@ -113,8 +139,10 @@ class AgentHarnessEngine:
 
     Key enterprise guarantees:
     - True incremental token & reasoning streaming (`llm.stream`) raced against `CancellationToken`.
-    - Clean per-turn transient Skill instruction injection (`turn_system_instructions`) paired
-      with `allowed_tools` dual-layer scoping.
+    - KV Prefix Cache-optimal transient dynamic context injection (`preserve_prompt_cache=True`),
+      deterministic sorted tool prefix, `prompt_cache_key`, and dual-layer `allowed_tools` scoping.
+    - Trusted temporal anchors, automatic long-term project memory recall, non-destructive
+      compaction anchors, output-length truncation auto-recovery, and mid-turn steering / follow-up queues.
     - Synchronous Dynamic Access Control Policy (ACP) evaluation (`DENY` / `ASK` / `ALLOW` + Shadow `AUDIT`).
     - Reversible `HarnessHook` plugin seam (`add_hook() -> dispose`) with DLP redaction applied
       BEFORE persisting tool outputs to the tamper-evident audit journal.
@@ -134,6 +162,9 @@ class AgentHarnessEngine:
         telemetry: TelemetryRecorder | None = None,
         subagent_manager: Any | None = None,
         summary_llm: BaseLLMClient | None = None,
+        steering_queue: TurnSteeringQueue | None = None,
+        memory_store: ProjectMemoryStore | None = None,
+        default_timezone: str | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -144,6 +175,9 @@ class AgentHarnessEngine:
         self.telemetry = telemetry
         self.subagent_manager = subagent_manager
         self.summary_llm = summary_llm
+        self.steering_queue = steering_queue
+        self.memory_store = memory_store
+        self.default_timezone = default_timezone
         self.compressor = ContextCompressor(
             threshold_tokens=self.config.context_compress_threshold,
             keep_recent_messages=self.config.keep_recent_messages,
@@ -227,11 +261,12 @@ class AgentHarnessEngine:
             )
             return await _finalize_and_emit(res)
 
-        # 2. Enforce active Skill `allowed_tools` least-privilege scope
+        # 2. Enforce active Skill `allowed_tools` least-privilege scope (always permitting built-in LOW-risk meta-tools)
         if (
             self.config.enforce_skill_tool_scope
             and allowed_tools is not None
             and tc.name not in allowed_tools
+            and tc.name not in self.config.always_allowed_meta_tools
         ):
             res = ToolResult(
                 tool_call_id=tc.id,
@@ -438,6 +473,19 @@ class AgentHarnessEngine:
             async with semaphore:
                 for _ in range(attempts):
                     cancellation.raise_if_cancelled()
+                    if (
+                        self.steering_queue is not None
+                        and self.steering_queue.has_steer(session_id)
+                    ):
+                        res = ToolResult(
+                            tool_call_id=tc.id,
+                            tool_name=tc.name,
+                            content="[Skipped due to user mid-turn steering]",
+                            is_error=False,
+                            duration_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                            metadata={"skipped_by_steering": True},
+                        )
+                        return await _finalize_and_emit(res)
                     try:
                         if inspect.iscoroutinefunction(reg.handler):
                             raw_out = await self._await_with_cancellation(
@@ -476,23 +524,97 @@ class AgentHarnessEngine:
         return await _finalize_and_emit(res)
 
     @staticmethod
+    def _extract_compaction_summary(messages: list[Message]) -> str:
+        prefix = "[Incremental Context Summary]"
+        for msg in messages:
+            if msg.role == "system" and msg.content.startswith(prefix):
+                body = msg.content[len(prefix) :].lstrip("\r\n").strip()
+                return body or msg.content.strip()
+        return ""
+
+    @staticmethod
     def _build_turn_view_messages(
         messages: list[Message],
         turn_system_instructions: str | None,
+        *,
+        preserve_prompt_cache: bool = True,
+        tail_context_blocks: list[str] | None = None,
     ) -> list[Message]:
         """
-        Overlay turn-scoped dynamic Skill instructions onto a transient view of `messages`
-        so `messages[0]` remains clean across future dialogue turns.
+        Overlay turn-scoped dynamic instructions & tail context onto a transient view of `messages`
+        without mutating persistent history.
+
+        - `preserve_prompt_cache=True` (v0.4.0 default): keeps `view[0]` (system prompt) 100%
+          byte-identical across turns and steps for optimal KV prefix caching, injecting dynamic
+          context onto the transient copy of the last `user` message.
+        - `preserve_prompt_cache=False` (legacy): concatenates `turn_system_instructions` onto
+          `view[0]` and appends any `tail_context_blocks` onto the transient last `user` message.
         """
-        if not turn_system_instructions:
-            return list(messages)
         view = list(messages)
-        if view and view[0].role == "system":
-            view[0] = view[0].model_copy(
-                update={"content": f"{view[0].content}\n\n{turn_system_instructions}"}
+        clean_tail_blocks = [
+            block.strip()
+            for block in (tail_context_blocks or [])
+            if block and block.strip()
+        ]
+        clean_turn_inst = (
+            turn_system_instructions.strip()
+            if turn_system_instructions and turn_system_instructions.strip()
+            else ""
+        )
+
+        if not preserve_prompt_cache:
+            if turn_system_instructions:
+                if view and view[0].role == "system":
+                    view[0] = view[0].model_copy(
+                        update={
+                            "content": f"{view[0].content}\n\n{turn_system_instructions}"
+                        }
+                    )
+                else:
+                    view.insert(
+                        0, Message(role="system", content=turn_system_instructions)
+                    )
+            if clean_tail_blocks:
+                tail_overlay = "\n\n".join(clean_tail_blocks)
+                last_user_idx = next(
+                    (i for i in range(len(view) - 1, -1, -1) if view[i].role == "user"),
+                    None,
+                )
+                if last_user_idx is not None:
+                    orig_user = view[last_user_idx]
+                    view[last_user_idx] = orig_user.model_copy(
+                        update={"content": f"{orig_user.content}\n\n{tail_overlay}"}
+                    )
+                else:
+                    view.append(Message(role="user", content=tail_overlay))
+            return view
+
+        overlay_parts: list[str] = []
+        if clean_turn_inst:
+            overlay_parts.append(clean_turn_inst)
+        overlay_parts.extend(clean_tail_blocks)
+        if not overlay_parts:
+            return view
+
+        overlay = "\n\n".join(overlay_parts)
+        last_user_idx = next(
+            (i for i in range(len(view) - 1, -1, -1) if view[i].role == "user"),
+            None,
+        )
+        if last_user_idx is not None:
+            orig_user = view[last_user_idx]
+            view[last_user_idx] = orig_user.model_copy(
+                update={
+                    "content": (
+                        f"[Turn Dynamic Context]\n{overlay}\n\n"
+                        f"[User Request]\n{orig_user.content}"
+                    )
+                }
             )
         else:
-            view.insert(0, Message(role="system", content=turn_system_instructions))
+            view.append(
+                Message(role="user", content=f"[Turn Dynamic Context]\n{overlay}")
+            )
         return view
 
     async def _stream_llm_step(
@@ -503,7 +625,8 @@ class AgentHarnessEngine:
         llm_messages: list[Message],
         available_tools: list[ToolSpec],
         cancellation: CancellationToken,
-    ) -> tuple[str, str, list[ToolCall], TokenUsage, bool, str]:
+        prompt_cache_key: str | None = None,
+    ) -> tuple[str, str, list[ToolCall], TokenUsage, bool, str, str]:
         """Consume `self.llm.stream(...)` live while racing every chunk against `CancellationToken`."""
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -511,6 +634,7 @@ class AgentHarnessEngine:
         step_usage = TokenUsage()
         emitted_token_delta = False
         seen_model = ""
+        finish_reason = "stop"
 
         principal = current_principal.get()
         span_cm = (
@@ -528,7 +652,14 @@ class AgentHarnessEngine:
         )
 
         with span_cm as span:
-            ait = self.llm.stream(llm_messages, tools=available_tools).__aiter__()
+            if prompt_cache_key and _supports_kwarg(self.llm.stream, "prompt_cache_key"):
+                ait = self.llm.stream(
+                    llm_messages,
+                    tools=available_tools,
+                    prompt_cache_key=prompt_cache_key,
+                ).__aiter__()
+            else:
+                ait = self.llm.stream(llm_messages, tools=available_tools).__aiter__()
             try:
                 while True:
                     try:
@@ -540,6 +671,9 @@ class AgentHarnessEngine:
 
                     if chunk.model:
                         seen_model = chunk.model
+
+                    if chunk.finish_reason:
+                        finish_reason = chunk.finish_reason
 
                     if chunk.reasoning_delta:
                         reasoning_parts.append(chunk.reasoning_delta)
@@ -596,7 +730,33 @@ class AgentHarnessEngine:
             step_usage,
             emitted_token_delta,
             seen_model,
+            finish_reason,
         )
+
+    async def _compress_and_anchor(
+        self,
+        session_id: str,
+        turn_id: str,
+        messages: list[Message],
+    ) -> list[Message]:
+        messages, stats = await self.compressor.acompress(
+            messages, summary_llm=self.summary_llm
+        )
+        if stats["messages_folded"] > 0:
+            await self.journal.emit(
+                session_id,
+                turn_id,
+                EventType.CONTEXT_COMPRESSED,
+                stats,
+            )
+            summary_body = self._extract_compaction_summary(messages)
+            await self.journal.emit(
+                session_id,
+                turn_id,
+                EventType.COMPACTION_ANCHOR,
+                {"summary": summary_body, **stats},
+            )
+        return messages
 
     async def run_turn(
         self,
@@ -607,6 +767,8 @@ class AgentHarnessEngine:
         cancellation: CancellationToken | None = None,
         turn_system_instructions: str | None = None,
         allowed_tools: set[str] | None = None,
+        timezone_name: str | None = None,
+        project_id: str | None = None,
     ) -> TurnResult:
         turn_id = f"turn_{uuid.uuid4().hex[:10]}"
         cancel = cancellation or CancellationToken()
@@ -614,7 +776,43 @@ class AgentHarnessEngine:
         semaphore = asyncio.Semaphore(self.config.max_parallel_tools)
         principal = current_principal.get()
         tenant_id = principal.tenant_id if principal else "default"
+        user_id = principal.user_id if principal else "anonymous"
+        eff_project_id = (project_id or "").strip() or current_project_id.get() or "default"
+        prompt_cache_key = f"pyharness:{tenant_id}:{session_id}"
         t_start = time.perf_counter()
+
+        turn_tail_blocks: list[str] = []
+        eff_tz = timezone_name if timezone_name is not None else self.default_timezone
+        if eff_tz:
+            temporal = TrustedTemporalContext.capture(eff_tz)
+            turn_tail_blocks.append(temporal.render_prompt_block())
+
+        if self.memory_store is not None:
+            memories = await self.memory_store.recall(
+                user_input,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                project_id=eff_project_id,
+                top_k=3,
+            )
+            if memories:
+                mem_block = ProjectMemoryStore.render_prompt_block(memories)
+                if mem_block:
+                    turn_tail_blocks.append(mem_block)
+
+        if (
+            self.config.enforce_skill_tool_scope
+            and allowed_tools is not None
+            and self.config.preserve_prompt_cache
+        ):
+            registered_meta = {
+                t for t in self.config.always_allowed_meta_tools if self.tools.get(t) is not None
+            }
+            eff_scope = sorted(allowed_tools | registered_meta)
+            turn_tail_blocks.append(
+                f"[Active Skill Tool Scope] For this turn, only invoke tools in: "
+                f"{', '.join(eff_scope)}."
+            )
 
         messages: list[Message] = list(history) if history else [
             Message(role="system", content=system_prompt)
@@ -630,6 +828,8 @@ class AgentHarnessEngine:
 
         consecutive_errors = 0
         steps = 0
+        length_recoveries = 0
+        length_continuation_parts: list[str] = []
 
         sub_ctx = (
             self.subagent_manager.bind_parent_context(
@@ -654,6 +854,16 @@ class AgentHarnessEngine:
             if self.telemetry is not None
             else nullcontext()
         )
+        turn_ctx_cm = use_turn_context(
+            ActiveTurnContext(
+                session_id=session_id,
+                turn_id=turn_id,
+                cancellation=cancel,
+                owner_user_id=user_id,
+                tenant_id=tenant_id,
+            )
+        )
+        project_ctx_cm = use_project_id(eff_project_id)
 
         def _finish(result: TurnResult) -> TurnResult:
             if self.telemetry is not None:
@@ -662,32 +872,41 @@ class AgentHarnessEngine:
                 )
             return result
 
-        with turn_span, sub_ctx:
+        with turn_span, sub_ctx, turn_ctx_cm, project_ctx_cm:
             try:
-                for step in range(1, self.config.max_steps + 1):
+                step = 0
+                step_limit = self.config.max_steps
+                step_ceiling = self.config.max_steps * 4
+                while step < step_limit:
+                    step += 1
                     cancel.raise_if_cancelled()
                     steps = step
 
                     # Step A: Context window guard & incremental (or LLM-assisted) compression
                     if self.compressor.should_compress(messages):
-                        messages, stats = await self.compressor.acompress(
-                            messages, summary_llm=self.summary_llm
+                        messages = await self._compress_and_anchor(
+                            session_id, turn_id, messages
                         )
-                        if stats["messages_folded"] > 0:
-                            await self.journal.emit(
-                                session_id,
-                                turn_id,
-                                EventType.CONTEXT_COMPRESSED,
-                                stats,
-                            )
 
                     # Step B: Build per-turn transient prompt view + tool scope + run hooks
                     llm_messages = self._build_turn_view_messages(
-                        messages, turn_system_instructions
+                        messages,
+                        turn_system_instructions,
+                        preserve_prompt_cache=self.config.preserve_prompt_cache,
+                        tail_context_blocks=turn_tail_blocks,
                     )
                     available_tools = self.tools.list_specs()
-                    if self.config.enforce_skill_tool_scope and allowed_tools is not None:
-                        available_tools = [t for t in available_tools if t.name in allowed_tools]
+                    if (
+                        self.config.enforce_skill_tool_scope
+                        and allowed_tools is not None
+                        and not self.config.preserve_prompt_cache
+                    ):
+                        available_tools = [
+                            t
+                            for t in available_tools
+                            if t.name in allowed_tools
+                            or t.name in self.config.always_allowed_meta_tools
+                        ]
 
                     for hook in list(self._hooks):
                         llm_messages, available_tools = await hook.before_llm(
@@ -702,6 +921,7 @@ class AgentHarnessEngine:
                         step_usage,
                         emitted_token_delta,
                         _seen_model,
+                        finish_reason,
                     ) = await self._stream_llm_step(
                         session_id=session_id,
                         turn_id=turn_id,
@@ -709,10 +929,12 @@ class AgentHarnessEngine:
                         llm_messages=llm_messages,
                         available_tools=available_tools,
                         cancellation=cancel,
+                        prompt_cache_key=prompt_cache_key,
                     )
                     budget.record(step_usage)
 
                     if budget.is_exceeded:
+                        combined_answer = "".join([*length_continuation_parts, full_content])
                         msg = (
                             f"Token budget exceeded: {budget.usage.total_tokens} > "
                             f"{self.config.max_tokens_per_turn}"
@@ -728,7 +950,7 @@ class AgentHarnessEngine:
                                 session_id=session_id,
                                 turn_id=turn_id,
                                 status=TurnStatus.BUDGET_EXCEEDED,
-                                final_answer=full_content,
+                                final_answer=combined_answer,
                                 steps_executed=steps,
                                 usage=budget.usage,
                                 total_duration_ms=round((time.perf_counter() - t_start) * 1000.0, 2),
@@ -737,8 +959,111 @@ class AgentHarnessEngine:
                             )
                         )
 
+                    # Step C2: Output length truncation auto-recovery
+                    if (
+                        finish_reason == "length"
+                        and not tool_calls
+                        and self.config.enable_length_recovery
+                        and length_recoveries < self.config.max_length_recoveries
+                    ):
+                        length_recoveries += 1
+                        if full_content:
+                            length_continuation_parts.append(full_content)
+                        messages.append(Message(role="assistant", content=full_content))
+                        if not emitted_token_delta and full_content:
+                            await self.journal.emit(
+                                session_id,
+                                turn_id,
+                                EventType.TOKEN_DELTA,
+                                {"content": full_content},
+                            )
+                        if (
+                            self.compressor.should_compress(messages)
+                            or len(messages) > self.config.keep_recent_messages + 2
+                        ):
+                            messages = await self._compress_and_anchor(
+                                session_id, turn_id, messages
+                            )
+                        messages.append(
+                            Message(
+                                role="user",
+                                content=(
+                                    "Your previous response was truncated due to output length limit. "
+                                    "Continue concisely from where you stopped without repeating earlier content."
+                                ),
+                            )
+                        )
+                        step_limit = min(step_ceiling, max(step_limit, step + 1))
+                        continue
+
                     # Step D: Final answer (no tool calls)
                     if not tool_calls:
+                        # 1. Check late mid-turn steer before completing
+                        if (
+                            self.steering_queue is not None
+                            and self.steering_queue.has_steer(session_id)
+                        ):
+                            messages.append(Message(role="assistant", content=full_content))
+                            if not emitted_token_delta and full_content:
+                                await self.journal.emit(
+                                    session_id,
+                                    turn_id,
+                                    EventType.TOKEN_DELTA,
+                                    {"content": full_content},
+                                )
+                            steers = self.steering_queue.pop_all_steers(session_id)
+                            for st in steers:
+                                await self.journal.emit(
+                                    session_id,
+                                    turn_id,
+                                    EventType.TURN_STEERED,
+                                    {
+                                        "message_id": st.message_id,
+                                        "content": st.content,
+                                        "step": step,
+                                    },
+                                )
+                                messages.append(Message(role="user", content=st.content))
+                            length_continuation_parts.clear()
+                            consecutive_errors = 0
+                            step_limit = min(step_ceiling, max(step_limit, step + 2))
+                            continue
+
+                        # 2. Check queued post-turn follow-ups before completing
+                        if (
+                            self.steering_queue is not None
+                            and self.steering_queue.has_followup(session_id)
+                        ):
+                            messages.append(Message(role="assistant", content=full_content))
+                            if not emitted_token_delta and full_content:
+                                await self.journal.emit(
+                                    session_id,
+                                    turn_id,
+                                    EventType.TOKEN_DELTA,
+                                    {"content": full_content},
+                                )
+                            fu = self.steering_queue.pop_followup(session_id)
+                            if fu is not None:
+                                await self.journal.emit(
+                                    session_id,
+                                    turn_id,
+                                    EventType.FOLLOWUP_ENQUEUED,
+                                    {"message_id": fu.message_id, "content": fu.content},
+                                )
+                                await self.journal.emit(
+                                    session_id,
+                                    turn_id,
+                                    EventType.TOKEN_DELTA,
+                                    {"content": "\n\n---\n\n"},
+                                )
+                                messages.append(Message(role="user", content=fu.content))
+                                length_continuation_parts.clear()
+                                length_recoveries = 0
+                                consecutive_errors = 0
+                                step_limit = min(step_ceiling, step + self.config.max_steps)
+                                continue
+
+                        combined_answer = "".join([*length_continuation_parts, full_content])
                         messages.append(Message(role="assistant", content=full_content))
                         if not emitted_token_delta:
                             await self.journal.emit(
@@ -762,7 +1087,7 @@ class AgentHarnessEngine:
                                 session_id=session_id,
                                 turn_id=turn_id,
                                 status=TurnStatus.COMPLETED,
-                                final_answer=full_content,
+                                final_answer=combined_answer,
                                 steps_executed=steps,
                                 usage=budget.usage,
                                 total_duration_ms=round((time.perf_counter() - t_start) * 1000.0, 2),
@@ -804,6 +1129,26 @@ class AgentHarnessEngine:
                         )
                         if tr.is_error:
                             step_had_error = True
+
+                    # Drain mid-turn steering directives queued during tool execution
+                    if self.steering_queue is not None:
+                        steers = self.steering_queue.pop_all_steers(session_id)
+                        if steers:
+                            for st in steers:
+                                await self.journal.emit(
+                                    session_id,
+                                    turn_id,
+                                    EventType.TURN_STEERED,
+                                    {
+                                        "message_id": st.message_id,
+                                        "content": st.content,
+                                        "step": step,
+                                    },
+                                )
+                                messages.append(Message(role="user", content=st.content))
+                            consecutive_errors = 0
+                            step_limit = min(step_ceiling, max(step_limit, step + 2))
+                            continue
 
                     # Step F: Self-Correction loop accounting & breaker
                     if step_had_error:

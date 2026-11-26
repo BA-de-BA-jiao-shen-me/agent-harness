@@ -23,15 +23,23 @@ class EventType(StrEnum):
     THINKING = "thinking"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
+    ARTIFACT_CREATED = "artifact_created"
     APPROVAL_REQUIRED = "approval_required"
     APPROVAL_RESOLVED = "approval_resolved"
+    QUESTION_REQUIRED = "question_required"
+    QUESTION_ANSWERED = "question_answered"
+    TURN_STEERED = "turn_steered"
+    FOLLOWUP_ENQUEUED = "followup_enqueued"
     POLICY_EVALUATED = "policy_evaluated"
     SECURITY_ALERT = "security_alert"
     SUBAGENT_START = "subagent_start"
     SUBAGENT_COMPLETE = "subagent_complete"
     SESSION_FORKED = "session_forked"
+    BRANCH_SWITCHED = "branch_switched"
     CONTEXT_COMPRESSED = "context_compressed"
+    COMPACTION_ANCHOR = "compaction_anchor"
     SELF_CORRECTION = "self_correction"
+    SCHEDULED_TASK_RUN = "scheduled_task_run"
     TOKEN_DELTA = "token_delta"
     TURN_COMPLETE = "turn_complete"
     TURN_CANCELLED = "turn_cancelled"
@@ -129,6 +137,7 @@ class LLMResponse(BaseModel):
     usage: TokenUsage = Field(default_factory=TokenUsage)
     model: str = ""
     latency_ms: float = 0.0
+    finish_reason: str = "stop"
 
 
 class LLMStreamChunk(BaseModel):
@@ -139,6 +148,7 @@ class LLMStreamChunk(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     usage: TokenUsage | None = None
     model: str = ""
+    finish_reason: str | None = None
     is_final: bool = False
 
 
@@ -154,6 +164,8 @@ class HarnessEvent(BaseModel):
     user_id: str = "anonymous"
     prev_hash: str = ""
     event_hash: str = ""
+    parent_event_id: str | None = None
+    branch_name: str = "main"
 
 
 class TurnResult(BaseModel):

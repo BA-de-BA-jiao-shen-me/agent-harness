@@ -22,6 +22,8 @@ from pyharness.rag import (
 from pyharness.runtime import (
     AgentHarnessEngine,
     ApprovalBroker,
+    ArtifactRecord,
+    BaseArtifactStore,
     BaseLLMClient,
     CancellationToken,
     EventJournal,
@@ -33,10 +35,21 @@ from pyharness.runtime import (
     ModelRoute,
     ModelRouterLLMClient,
     OpenAICompatibleLLMClient,
+    ProjectMemoryStore,
+    RuntimeIdleReaper,
+    ScheduledTaskManager,
+    SessionAdmissionController,
     SubagentManager,
     TokenUsage,
     ToolCall,
+    ToolOutputOffloadHook,
     ToolRegistry,
+    TopicAdmissionGuard,
+    TurnSteeringQueue,
+    UserQuestionBroker,
+    create_artifact_store,
+    current_turn_context,
+    register_artifact_tools,
 )
 from pyharness.sandbox import (
     PythonSandbox,
@@ -46,6 +59,7 @@ from pyharness.sandbox import (
 )
 from pyharness.security import (
     AuthManager,
+    CredentialRelay,
     GuardrailHook,
     PolicyEngine,
     QuotaManager,
@@ -55,7 +69,8 @@ from pyharness.skills import SkillRouter
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are PyHarness, an enterprise AI assistant with Hybrid RAG, MCP tools, "
-    "governed subagent delegation, dynamic access control policies, and isolated SQL/Python sandboxes."
+    "governed subagent delegation, dynamic access control policies, interactive clarification, "
+    "long-term project memory, and isolated SQL/Python sandboxes."
 )
 
 BUILTIN_DEMO_DOC = """
@@ -77,10 +92,17 @@ BUILTIN_DEMO_DOC = """
 class DemoSmartRouterLLM(BaseLLMClient):
     """
     Zero-API-key interactive demo LLM so reviewers can run the full platform locally
-    and experience live RAG citations, SQL queries, Python sandboxes, subagents, and approvals.
+    and experience live RAG citations, SQL queries, Python sandboxes, subagents,
+    interactive clarification, and approvals.
     """
 
-    async def complete(self, messages: list[Message], tools=None) -> LLMResponse:
+    async def complete(
+        self,
+        messages: list[Message],
+        tools=None,
+        *,
+        prompt_cache_key: str | None = None,
+    ) -> LLMResponse:
         last = messages[-1]
         if last.role == "tool":
             tool_outputs = []
@@ -99,10 +121,24 @@ class DemoSmartRouterLLM(BaseLLMClient):
                 model="pyharness-demo-planner",
             )
 
-        q = last.content.lower()
+        # Extract the clean user request when KV-cache-preserving tail overlay is present
+        raw_user_text = last.content.rsplit("[User Request]\n", 1)[-1]
+        q = raw_user_text.lower()
         calls: list[ToolCall] = []
         reasoning = "分析用户请求意图并路由至对应受控工具。"
-        if any(k in q for k in ("委派", "子代理", "subagent")):
+        if any(k in q for k in ("澄清", "追问", "clarify")):
+            reasoning = "检测到请求口径存在歧义，调用 ask_user_question 挂起并向用户请求结构化澄清。"
+            calls.append(
+                ToolCall(
+                    name="ask_user_question",
+                    arguments={
+                        "question": "请确认本次设备排查统计的时间范围与厂区范围：",
+                        "options": ["本周全厂", "本月金山A区", "近30天高危工单"],
+                        "allow_free_text": True,
+                    },
+                )
+            )
+        elif any(k in q for k in ("委派", "子代理", "subagent")):
             reasoning = "检测到复合排查意图，通过 ctx.subagents 并行委派隔离上下文子代理执行调查。"
             calls.append(
                 ToolCall(
@@ -141,7 +177,9 @@ class DemoSmartRouterLLM(BaseLLMClient):
             )
         else:
             reasoning = "检测到知识规范查询意图，调用企业 Hybrid RAG 混合检索与精排引擎。"
-            calls.append(ToolCall(name="rag_search", arguments={"query": last.content, "top_k": 3}))
+            calls.append(
+                ToolCall(name="rag_search", arguments={"query": raw_user_text, "top_k": 3})
+            )
 
         return LLMResponse(
             reasoning_content=reasoning,
@@ -152,7 +190,7 @@ class DemoSmartRouterLLM(BaseLLMClient):
 
 
 class _SecurityControlPlanePlugin(HarnessPlugin):
-    """Mounts AuthN/RBAC, ACP PolicyEngine, GuardrailHook (DLP+Injection), and FinOps QuotaManager."""
+    """Mounts AuthN/RBAC, ACP PolicyEngine, GuardrailHook (DLP+Injection), QuotaManager, and CredentialRelay."""
 
     name = "security_control_plane"
 
@@ -165,8 +203,65 @@ class _SecurityControlPlanePlugin(HarnessPlugin):
         ctx.provide("policy", rt.policy_engine)
         ctx.provide("quota", rt.quota_manager)
         ctx.provide("telemetry", rt.telemetry)
+        ctx.provide("credential_relay", rt.credential_relay)
+        # IMPORTANT: Mount GuardrailHook BEFORE ToolOutputOffloadHook so DLP redacts secrets
+        # BEFORE any oversized tool output is persisted to ArtifactStore or EventJournal!
         dispose_guardrail = rt.engine.add_hook(rt.guardrail_hook)
         ctx.effect(dispose_guardrail)
+        ctx.effect(rt.credential_relay.aclose)
+
+
+class _ContextAndResiliencePlugin(HarnessPlugin):
+    """
+    Mounts v0.4.0 Pi + MOVO Context & Resilience capabilities:
+    - ToolOutputOffloadHook & Artifact inspection tools (`read_artifact`, `list_artifacts`)
+    - Long-term Project Memory (`remember_fact`, `recall_memory`)
+    - Interactive Clarification Broker (`ask_user_question`)
+    - Session Admission Control, Topic Guard, Idle Reaper, and Scheduled Task Manager
+    """
+
+    name = "context_and_resilience"
+
+    def __init__(self, container: RuntimeContainer) -> None:
+        self._rt = container
+
+    async def install(self, ctx: PluginContext) -> None:
+        rt = self._rt
+        dispose_offload = rt.engine.add_hook(rt.offload_hook)
+        ctx.effect(dispose_offload)
+
+        def _current_sid() -> str | None:
+            tctx = current_turn_context.get()
+            return tctx.session_id if tctx is not None else None
+
+        register_artifact_tools(rt.tools, rt.artifact_store, session_id_getter=_current_sid)
+        rt.memory_store.register_tools(rt.tools)
+
+        async def _on_question_required(sid: str, tid: str, payload: dict[str, Any]) -> None:
+            await rt.journal.emit(sid, tid, EventType.QUESTION_REQUIRED, payload)
+
+        async def _on_question_answered(sid: str, tid: str, payload: dict[str, Any]) -> None:
+            await rt.journal.emit(sid, tid, EventType.QUESTION_ANSWERED, payload)
+
+        rt.question_broker.register_tools(
+            rt.tools,
+            on_question_required=_on_question_required,
+            on_question_answered=_on_question_answered,
+        )
+
+        ctx.provide("artifact_store", rt.artifact_store)
+        ctx.provide("memory_store", rt.memory_store)
+        ctx.provide("steering_queue", rt.steering_queue)
+        ctx.provide("question_broker", rt.question_broker)
+        ctx.provide("admission", rt.admission_controller)
+        ctx.provide("topic_guard", rt.topic_guard)
+        ctx.provide("scheduler", rt.scheduler)
+
+        rt.idle_reaper.start()
+        ctx.effect(rt.idle_reaper.stop)
+        ctx.effect(rt.scheduler.stop)
+        ctx.effect(rt.artifact_store.aclose)
+        ctx.effect(rt.memory_store.aclose)
 
 
 class _SandboxAndToolsPlugin(HarnessPlugin):
@@ -218,14 +313,19 @@ class RuntimeContainer:
     """
     Enterprise Dependency Container orchestrated via a Cordis-inspired `PluginContext`.
 
-    Wires pluggable Seams:
+    Wires pluggable Seams (v0.4.0):
     - `AuthManager` (JWT / API Key / Trusted Gateway + RBAC)
     - `PolicyEngine` (Dynamic ACP `allow` / `ask` / `deny` + Shadow `audit`)
     - `GuardrailHook` (DLP secret/PII redaction + indirect prompt injection tagging)
+    - `CredentialRelay` (Zero-Trust host-side scoped secret relay with SSRF protection)
     - `QuotaManager` (Sliding-window RPM + daily departmental FinOps ledger)
-    - `JournalStorageBackend` (PostgreSQL multi-Pod / SQLite WAL + SHA-256 hash chain)
+    - `JournalStorageBackend` (PostgreSQL / SQLite WAL + SHA-256 chain + In-Place Session Tree)
+    - `BaseArtifactStore` (InMemory / File / S3-MinIO Seam + `ToolOutputOffloadHook`)
+    - `ProjectMemoryStore` & `TrustedTemporalContext` (Cross-session memory & server clock)
+    - `TurnSteeringQueue` & `UserQuestionBroker` (Mid-turn steer/follow-up & clarification)
+    - `SessionAdmissionController`, `TopicAdmissionGuard`, `RuntimeIdleReaper`, `ScheduledTaskManager`
     - `CoordinationBackend` (Redis Pub/Sub + locks + approvals or In-Memory)
-    - `ModelRouterLLMClient` (Primary -> Fallback circuit breaker + Reasoning/Fast tiers)
+    - `ModelRouterLLMClient` (Weighted canary traffic allocation + Failover + Reasoning/Fast tiers)
     - `SandboxProvider` (Docker+socket-proxy / gVisor / E2B MicroVM / Isolated Subprocess)
     - `BaseVectorStore` (Qdrant persistent ACL-filtered vector store or In-Memory)
     - `TelemetryRecorder` (OpenTelemetry GenAI spans + Prometheus `/metrics`)
@@ -243,6 +343,12 @@ class RuntimeContainer:
         profile: str | None = None,
         enforce_four_eyes: bool | None = None,
         rpm_limit: int | None = None,
+        artifact_store: BaseArtifactStore | None = None,
+        memory_store: ProjectMemoryStore | None = None,
+        topic_guard: TopicAdmissionGuard | None = None,
+        admission_controller: SessionAdmissionController | None = None,
+        credential_relay: CredentialRelay | None = None,
+        max_inline_tool_chars: int | None = None,
     ) -> None:
         root_dir = Path(__file__).resolve().parent.parent.parent
         self.profile = (profile or os.getenv("HARNESS_PROFILE", "enterprise")).strip().lower()
@@ -255,10 +361,11 @@ class RuntimeContainer:
         qdrant_collection = os.getenv("QDRANT_COLLECTION", "pyharness_chunks").strip()
         sandbox_mode = os.getenv("HARNESS_SANDBOX_PROVIDER", "auto").strip()
 
-        # 1. Identity, Telemetry & Coordination
+        # 1. Identity, Telemetry, Credential Relay & Coordination
         self.auth_manager: AuthManager = auth_manager or AuthManager.from_env()
         self.telemetry = TelemetryRecorder(service_name="pyharness")
         self.coordination: CoordinationBackend = coordination or create_coordination_backend(redis_url)
+        self.credential_relay: CredentialRelay = credential_relay or CredentialRelay()
 
         allow_self_env = os.getenv("HARNESS_APPROVAL_ALLOW_SELF", "").strip().lower()
         if enforce_four_eyes is not None:
@@ -270,7 +377,7 @@ class RuntimeContainer:
         else:
             sod_enabled = self.auth_manager.mode == "enforce"
 
-        # 2. Durable Hash-Chained EventJournal & Four-Eyes ApprovalBroker
+        # 2. Durable Hash-Chained Tree EventJournal & Governance Brokers
         self.journal = EventJournal(
             db_path=db_path,
             coordination=self.coordination,
@@ -281,15 +388,33 @@ class RuntimeContainer:
             coordination=self.coordination,
             enforce_four_eyes=sod_enabled,
         )
+        self.steering_queue = TurnSteeringQueue()
+        self.question_broker = UserQuestionBroker(
+            default_timeout_seconds=float(os.getenv("HARNESS_QUESTION_TIMEOUT", "120"))
+        )
 
-        # 3. Dynamic Policy Engine (ACP), Guardrails & FinOps Quota
+        # 3. Dynamic Policy Engine (ACP), Guardrails, Topic Guard & FinOps Quota
         if policy_engine is not None:
             self.policy_engine = policy_engine
         else:
             policy_file_env = os.getenv("HARNESS_POLICY_FILE", "").strip()
-            policy_path = Path(policy_file_env) if policy_file_env else (root_dir / "policies" / "enterprise_policy.yaml")
+            policy_path = (
+                Path(policy_file_env)
+                if policy_file_env
+                else (root_dir / "policies" / "enterprise_policy.yaml")
+            )
             self.policy_engine = (
                 PolicyEngine.from_yaml(policy_path) if policy_path.exists() else PolicyEngine()
+            )
+
+        if topic_guard is not None:
+            self.topic_guard = topic_guard
+        else:
+            topic_file_env = os.getenv("HARNESS_TOPIC_POLICY_FILE", "").strip()
+            self.topic_guard = (
+                TopicAdmissionGuard.from_yaml(topic_file_env)
+                if topic_file_env and Path(topic_file_env).exists()
+                else TopicAdmissionGuard()
             )
 
         async def _emit_security_alert(
@@ -317,7 +442,55 @@ class RuntimeContainer:
             enabled=os.getenv("HARNESS_QUOTA_ENABLED", "true").strip().lower() not in {"false", "0"},
         )
 
-        # 4. Tools, RAG & Isolated Sandboxes
+        # 4. Artifact Store, Tool Output Offloading & Long-Term Project Memory
+        if artifact_store is not None:
+            self.artifact_store: BaseArtifactStore = artifact_store
+        else:
+            art_mode = os.getenv("HARNESS_ARTIFACT_STORE_MODE", "auto").strip()
+            art_dir = os.getenv("HARNESS_ARTIFACT_DIR", "").strip() or None
+            art_s3_bucket = os.getenv("HARNESS_ARTIFACT_S3_BUCKET", "").strip() or None
+            art_s3_endpoint = os.getenv("HARNESS_ARTIFACT_S3_ENDPOINT", "").strip() or None
+            self.artifact_store = create_artifact_store(
+                mode=art_mode,
+                base_dir=art_dir,
+                s3_bucket=art_s3_bucket,
+                s3_endpoint_url=art_s3_endpoint,
+            )
+
+        async def _emit_artifact_created(
+            session_id: str, turn_id: str, rec: ArtifactRecord
+        ) -> None:
+            await self.journal.emit(
+                session_id,
+                turn_id,
+                EventType.ARTIFACT_CREATED,
+                {
+                    "artifact_id": rec.artifact_id,
+                    "session_id": rec.session_id,
+                    "tool_name": rec.tool_name,
+                    "char_count": rec.char_count,
+                    "preview": rec.preview,
+                    "storage_uri": rec.storage_uri,
+                    "created_at_ms": rec.created_at_ms,
+                },
+            )
+
+        eff_inline_chars = (
+            max_inline_tool_chars
+            if max_inline_tool_chars is not None
+            else int(os.getenv("HARNESS_MAX_INLINE_TOOL_CHARS", "4000"))
+        )
+        self.offload_hook = ToolOutputOffloadHook(
+            self.artifact_store,
+            max_inline_chars=eff_inline_chars,
+            on_artifact_created=_emit_artifact_created,
+        )
+
+        self.memory_store: ProjectMemoryStore = memory_store or ProjectMemoryStore(
+            os.getenv("HARNESS_MEMORY_DB", ":memory:")
+        )
+
+        # 5. Tools, RAG & Isolated Sandboxes
         self.tools = ToolRegistry()
 
         embed_key = os.getenv("EMBEDDING_API_KEY", "").strip()
@@ -358,7 +531,24 @@ class RuntimeContainer:
         self.session_histories: dict[str, list[Message]] = {}
         self._initialized = False
 
-        # 5. Multi-Model Router (Primary -> Fallback + Fast Tier)
+        # 6. Runtime Admission Control & Idle Reaper
+        self.admission_controller: SessionAdmissionController = (
+            admission_controller
+            or SessionAdmissionController(
+                max_global_active_turns=int(os.getenv("HARNESS_MAX_GLOBAL_TURNS", "64")),
+                max_tenant_active_turns=int(os.getenv("HARNESS_MAX_TENANT_TURNS", "16")),
+            )
+        )
+        self.idle_reaper = RuntimeIdleReaper(
+            self.session_histories,
+            idle_ttl_seconds=float(os.getenv("HARNESS_IDLE_TTL_SECONDS", "1800")),
+            sweep_interval_seconds=float(os.getenv("HARNESS_REAP_INTERVAL_SECONDS", "60")),
+            steering_queue=self.steering_queue,
+            credential_relay=self.credential_relay,
+            active_sessions_getter=self.admission_controller.active_sessions,
+        )
+
+        # 7. Multi-Model Router (Weighted Canary + Failover + Fast Tier)
         if llm is not None:
             self.llm: BaseLLMClient = llm
         else:
@@ -370,7 +560,7 @@ class RuntimeContainer:
             else None
         )
 
-        # 6. Subagent Manager & Governed AgentHarnessEngine
+        # 8. Subagent Manager, Governed AgentHarnessEngine & Autonomous Scheduler
         self.subagent_manager = SubagentManager(
             llm=self.llm,
             tools=self.tools,
@@ -390,11 +580,22 @@ class RuntimeContainer:
                 max_parallel_tools=int(os.getenv("HARNESS_MAX_PARALLEL_TOOLS", "4")),
                 context_compress_threshold=int(os.getenv("HARNESS_CONTEXT_COMPRESS_THRESHOLD", "6000")),
                 max_tokens_per_turn=int(os.getenv("HARNESS_MAX_TOKENS_PER_TURN", "32000")),
+                preserve_prompt_cache=os.getenv("HARNESS_PRESERVE_PROMPT_CACHE", "true").strip().lower()
+                not in {"false", "0"},
             ),
             policy_engine=self.policy_engine,
             telemetry=self.telemetry,
             subagent_manager=self.subagent_manager,
             summary_llm=summary_llm,
+            steering_queue=self.steering_queue,
+            memory_store=self.memory_store,
+        )
+
+        self.scheduler = ScheduledTaskManager(
+            engine=self.engine,
+            journal=self.journal,
+            artifact_store=self.artifact_store,
+            system_prompt=DEFAULT_SYSTEM_PROMPT,
         )
 
     @staticmethod
@@ -409,7 +610,13 @@ class RuntimeContainer:
             model=os.getenv("LLM_MODEL", "deepseek-chat"),
         )
         routes: list[ModelRoute] = [
-            ModelRoute(name="primary", client=primary, tier="reasoning", priority=0),
+            ModelRoute(
+                name="primary",
+                client=primary,
+                tier="reasoning",
+                priority=0,
+                weight=int(os.getenv("LLM_PRIMARY_WEIGHT", "100")),
+            ),
         ]
 
         fb_key = os.getenv("LLM_FALLBACK_API_KEY", "").strip()
@@ -420,7 +627,15 @@ class RuntimeContainer:
                 base_url=fb_url,
                 model=os.getenv("LLM_FALLBACK_MODEL", "deepseek-chat"),
             )
-            routes.append(ModelRoute(name="fallback", client=fallback, tier="reasoning", priority=1))
+            routes.append(
+                ModelRoute(
+                    name="fallback",
+                    client=fallback,
+                    tier="reasoning",
+                    priority=1,
+                    weight=int(os.getenv("LLM_FALLBACK_WEIGHT", "100")),
+                )
+            )
 
         fast_key = os.getenv("LLM_FAST_API_KEY", "").strip() or api_key
         fast_url = os.getenv("LLM_FAST_BASE_URL", "").strip() or os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
@@ -441,6 +656,7 @@ class RuntimeContainer:
         if self._initialized:
             return
         await self.plugin_context.mount(_SecurityControlPlanePlugin(self))
+        await self.plugin_context.mount(_ContextAndResiliencePlugin(self))
         await self.plugin_context.mount(_SandboxAndToolsPlugin(self))
         await self.plugin_context.mount(_SubagentsPlugin(self))
         self._initialized = True
@@ -451,7 +667,14 @@ class RuntimeContainer:
         await self.coordination.aclose()
         await self.journal.aclose()
         self.sql_sandbox.close()
+        self.memory_store.close()
 
     def shutdown(self) -> None:
+        # Cancel any background tasks cleanly when sync `shutdown()` is called in legacy tests
+        if getattr(self.idle_reaper, "_task", None) is not None:
+            self.idle_reaper._task.cancel()  # type: ignore[union-attr]
+        if getattr(self.scheduler, "_bg_task", None) is not None:
+            self.scheduler._bg_task.cancel()  # type: ignore[union-attr]
         self.journal.close()
         self.sql_sandbox.close()
+        self.memory_store.close()

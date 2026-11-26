@@ -10,6 +10,12 @@ from pyharness.security.auth import (
     use_principal,
     verify_hs256_jwt,
 )
+from pyharness.security.credential_relay import (
+    CredentialLease,
+    CredentialRelay,
+    CredentialRelayError,
+    CredentialTarget,
+)
 from pyharness.security.guardrails import (
     DLPScrubber,
     GuardrailHook,
@@ -50,4 +56,8 @@ __all__ = [
     "GuardrailHook",
     "QuotaExceededError",
     "QuotaManager",
+    "CredentialRelayError",
+    "CredentialTarget",
+    "CredentialLease",
+    "CredentialRelay",
 ]

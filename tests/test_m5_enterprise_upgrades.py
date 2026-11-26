@@ -18,6 +18,7 @@ from pyharness.runtime import (
     ApprovalBroker,
     EventJournal,
     EventType,
+    HarnessConfig,
     HarnessHook,
     LLMResponse,
     Message,
@@ -240,7 +241,13 @@ async def test_multi_turn_skill_switching_and_allowed_tools_enforcement() -> Non
             LLMResponse(content="已完成 SQL 表结构核查。"),
         ]
     )
-    engine = AgentHarnessEngine(llm=llm, tools=tools)
+    # Explicitly verify legacy `preserve_prompt_cache=False` physical tool-pruning & system overlay mode
+    # (v0.4.0 default `preserve_prompt_cache=True` KV-prefix stability is verified in `test_m7_pi_movo_upgrades.py`).
+    engine = AgentHarnessEngine(
+        llm=llm,
+        tools=tools,
+        config=HarnessConfig(preserve_prompt_cache=False),
+    )
 
     # Turn 1: Knowledge Research query
     t1_inst, t1_allowed, t1_skills = router.resolve_turn_context("查阅高压断路器排查规范制度")

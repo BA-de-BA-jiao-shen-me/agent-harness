@@ -26,7 +26,28 @@ class SessionRecord(BaseModel):
     owner_user_id: str = "anonymous"
     parent_session_id: str | None = None
     forked_from_seq: int | None = None
+    active_branch: str = "main"
     created_at_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+
+class BranchInfo(BaseModel):
+    """Metadata describing an in-place branch within a session tree."""
+
+    branch_name: str
+    base_event_id: str | None = None
+    head_event_id: str | None = None
+    event_count: int = 0
+    is_active: bool = False
+    created_at_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+
+class SessionTreeResult(BaseModel):
+    """Complete in-place session DAG / branch tree topology."""
+
+    session_id: str
+    active_branch: str = "main"
+    branches: list[BranchInfo] = Field(default_factory=list)
+    nodes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AuditVerificationResult(BaseModel):
@@ -132,11 +153,168 @@ def _verify_rows(session_id: str, rows: list[dict[str, Any]]) -> AuditVerificati
     )
 
 
+def _row_field(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _summarize_event_node(ev: dict[str, Any], max_len: int = 120) -> str:
+    payload = ev.get("payload") or {}
+    if not isinstance(payload, dict):
+        return ""
+    for key in (
+        "user_input",
+        "summary",
+        "tool_name",
+        "status",
+        "content",
+        "reason",
+        "target_branch",
+        "branch_name",
+    ):
+        val = payload.get(key)
+        if val is not None:
+            text = str(val).strip()
+            if text:
+                if key == "tool_name" and payload.get("is_error"):
+                    text = f"{text} (error)"
+                elif key == "status":
+                    text = f"status={text}"
+                if len(text) > max_len:
+                    return text[: max_len - 1] + "…"
+                return text
+    return ""
+
+
+def _walk_branch_chain(
+    events: list[dict[str, Any]],
+    head_event_id: str | None,
+) -> list[dict[str, Any]]:
+    if not head_event_id or not events:
+        return []
+    by_id = {str(ev["event_id"]): ev for ev in events}
+    if head_event_id not in by_id:
+        return []
+    chain: list[dict[str, Any]] = []
+    visited: set[str] = set()
+    cur_id: str | None = head_event_id
+    while cur_id is not None and cur_id not in visited:
+        ev = by_id.get(cur_id)
+        if ev is None:
+            break
+        visited.add(cur_id)
+        chain.append(ev)
+        parent_id = ev.get("parent_event_id")
+        cur_id = str(parent_id) if parent_id else None
+    chain.reverse()
+    return chain
+
+
+def _resolve_branch_events(
+    all_events: list[dict[str, Any]],
+    active_branch: str,
+    branches_by_name: dict[str, dict[str, Any]],
+    branch_name: str | None = None,
+) -> list[dict[str, Any]]:
+    target = (branch_name or "").strip() or active_branch or "main"
+    branch_row = branches_by_name.get(target)
+    if branch_row is not None:
+        head_id = branch_row.get("head_event_id")
+        if not head_id:
+            return []
+        return _walk_branch_chain(all_events, str(head_id))
+    # Legacy fallback when harness_branches has no entry for target yet (e.g. "main")
+    return [ev for ev in all_events if str(ev.get("branch_name") or "main") == target]
+
+
+def _build_session_tree(
+    session_id: str,
+    active_branch: str,
+    session_created_at_ms: int | None,
+    branch_rows: list[dict[str, Any]],
+    all_events: list[dict[str, Any]],
+) -> SessionTreeResult:
+    eff_active = active_branch or "main"
+    branches_by_name: dict[str, dict[str, Any]] = {
+        str(b["branch_name"]): dict(b) for b in branch_rows
+    }
+
+    if "main" not in branches_by_name and all_events:
+        main_events = [
+            ev for ev in all_events if str(ev.get("branch_name") or "main") == "main"
+        ]
+        head_id = str(main_events[-1]["event_id"]) if main_events else None
+        created_ms = (
+            int(session_created_at_ms)
+            if session_created_at_ms is not None
+            else int(all_events[0]["timestamp_ms"])
+        )
+        branches_by_name["main"] = {
+            "branch_name": "main",
+            "base_event_id": None,
+            "head_event_id": head_id,
+            "created_at_ms": created_ms,
+        }
+
+    ordered_names = sorted(
+        branches_by_name.keys(),
+        key=lambda name: (
+            0 if name == "main" else 1,
+            int(branches_by_name[name].get("created_at_ms") or 0),
+            name,
+        ),
+    )
+
+    branch_infos: list[BranchInfo] = []
+    for name in ordered_names:
+        row = branches_by_name[name]
+        head_id = row.get("head_event_id")
+        chain = _walk_branch_chain(all_events, str(head_id)) if head_id else []
+        if not chain and name == "main" and head_id is None and all_events:
+            chain = [
+                ev for ev in all_events if str(ev.get("branch_name") or "main") == "main"
+            ]
+        branch_infos.append(
+            BranchInfo(
+                branch_name=name,
+                base_event_id=row.get("base_event_id"),
+                head_event_id=head_id,
+                event_count=len(chain),
+                is_active=(name == eff_active),
+                created_at_ms=int(row.get("created_at_ms") or int(time.time() * 1000)),
+            )
+        )
+
+    nodes: list[dict[str, Any]] = [
+        {
+            "event_id": ev["event_id"],
+            "seq": int(ev["seq"]),
+            "turn_id": ev["turn_id"],
+            "event_type": ev["event_type"],
+            "parent_event_id": ev.get("parent_event_id"),
+            "branch_name": str(ev.get("branch_name") or "main"),
+            "timestamp_ms": int(ev["timestamp_ms"]),
+            "summary": _summarize_event_node(ev),
+        }
+        for ev in all_events
+    ]
+
+    return SessionTreeResult(
+        session_id=session_id,
+        active_branch=eff_active,
+        branches=branch_infos,
+        nodes=nodes,
+    )
+
+
 class JournalStorageBackend(ABC):
     """
     Pluggable durable persistence backend for EventJournal supporting:
     - Multi-tenant session ownership & fork lineage (`harness_sessions`).
     - Strict monotonic per-session event sequencing (`harness_events`).
+    - In-place zero-copy session branching (`harness_branches`).
     - Tamper-evident cryptographic SHA-256 hash chaining (`verify_chain`).
     - Point-in-time session forking (`fork_session`).
     """
@@ -178,6 +356,8 @@ class JournalStorageBackend(ABC):
         payload: dict[str, Any],
         tenant_id: str = "default",
         user_id: str = "anonymous",
+        branch_name: str | None = None,
+        parent_event_id: str | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -212,6 +392,37 @@ class JournalStorageBackend(ABC):
         tenant_id: str,
         owner_user_id: str,
     ) -> tuple[SessionRecord, int]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def create_branch(
+        self,
+        session_id: str,
+        branch_name: str,
+        from_event_id: str | None = None,
+        *,
+        switch: bool = True,
+    ) -> BranchInfo:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def switch_branch(
+        self,
+        session_id: str,
+        branch_name: str,
+    ) -> BranchInfo:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_branch_events(
+        self,
+        session_id: str,
+        branch_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_session_tree(self, session_id: str) -> SessionTreeResult:
         raise NotImplementedError
 
     @abstractmethod
@@ -259,6 +470,7 @@ class SQLiteJournalStore(JournalStorageBackend):
                     owner_user_id TEXT NOT NULL DEFAULT 'anonymous',
                     parent_session_id TEXT,
                     forked_from_seq INTEGER,
+                    active_branch TEXT NOT NULL DEFAULT 'main',
                     created_at_ms INTEGER NOT NULL
                 )
                 """
@@ -276,21 +488,48 @@ class SQLiteJournalStore(JournalStorageBackend):
                     tenant_id TEXT NOT NULL DEFAULT 'default',
                     user_id TEXT NOT NULL DEFAULT 'anonymous',
                     prev_hash TEXT NOT NULL DEFAULT '',
-                    event_hash TEXT NOT NULL DEFAULT ''
+                    event_hash TEXT NOT NULL DEFAULT '',
+                    parent_event_id TEXT,
+                    branch_name TEXT NOT NULL DEFAULT 'main'
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS harness_branches (
+                    session_id TEXT NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    base_event_id TEXT,
+                    head_event_id TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, branch_name)
                 )
                 """
             )
 
-            # Auto-migrate legacy harness_events tables missing enterprise audit columns
+            # Auto-migrate legacy harness_sessions tables missing active_branch
+            session_cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(harness_sessions)").fetchall()
+            }
+            if "active_branch" not in session_cols:
+                self._conn.execute(
+                    "ALTER TABLE harness_sessions ADD COLUMN active_branch TEXT NOT NULL DEFAULT 'main'"
+                )
+
+            # Auto-migrate legacy harness_events tables missing audit or tree columns
             cols = {
                 row["name"]
                 for row in self._conn.execute("PRAGMA table_info(harness_events)").fetchall()
             }
+            added_parent_col = "parent_event_id" not in cols
             migrations = (
                 ("tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
                 ("user_id", "TEXT NOT NULL DEFAULT 'anonymous'"),
                 ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
                 ("event_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("parent_event_id", "TEXT"),
+                ("branch_name", "TEXT NOT NULL DEFAULT 'main'"),
             )
             for col_name, col_ddl in migrations:
                 if col_name not in cols:
@@ -298,10 +537,32 @@ class SQLiteJournalStore(JournalStorageBackend):
                         f"ALTER TABLE harness_events ADD COLUMN {col_name} {col_ddl}"
                     )
 
+            if added_parent_col:
+                legacy_rows = self._conn.execute(
+                    "SELECT event_id, session_id FROM harness_events ORDER BY session_id ASC, seq ASC"
+                ).fetchall()
+                prev_by_sess: dict[str, str] = {}
+                for lr in legacy_rows:
+                    sid = str(lr["session_id"])
+                    eid = str(lr["event_id"])
+                    prev_eid = prev_by_sess.get(sid)
+                    if prev_eid is not None:
+                        self._conn.execute(
+                            "UPDATE harness_events SET parent_event_id = ? WHERE event_id = ?",
+                            (prev_eid, eid),
+                        )
+                    prev_by_sess[sid] = eid
+
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_events_session_seq
                 ON harness_events (session_id, seq)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_events_session_branch
+                ON harness_events (session_id, branch_name, seq)
                 """
             )
             self._conn.execute(
@@ -320,6 +581,7 @@ class SQLiteJournalStore(JournalStorageBackend):
             owner_user_id=row["owner_user_id"],
             parent_session_id=row["parent_session_id"],
             forked_from_seq=row["forked_from_seq"],
+            active_branch=str(_row_field(row, "active_branch") or "main"),
             created_at_ms=int(row["created_at_ms"]),
         )
 
@@ -337,6 +599,8 @@ class SQLiteJournalStore(JournalStorageBackend):
             "user_id": row["user_id"],
             "prev_hash": row["prev_hash"],
             "event_hash": row["event_hash"],
+            "parent_event_id": _row_field(row, "parent_event_id", None),
+            "branch_name": str(_row_field(row, "branch_name") or "main"),
         }
 
     def _ensure_session_sync(
@@ -352,8 +616,8 @@ class SQLiteJournalStore(JournalStorageBackend):
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO harness_sessions
-                (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, 'main', ?)
                 """,
                 (
                     session_id,
@@ -367,7 +631,7 @@ class SQLiteJournalStore(JournalStorageBackend):
             self._conn.commit()
             row = self._conn.execute(
                 """
-                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms
+                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms
                 FROM harness_sessions
                 WHERE session_id = ?
                 """,
@@ -397,7 +661,7 @@ class SQLiteJournalStore(JournalStorageBackend):
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms
+                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms
                 FROM harness_sessions
                 WHERE session_id = ?
                 """,
@@ -425,7 +689,7 @@ class SQLiteJournalStore(JournalStorageBackend):
         with self._lock:
             rows = self._conn.execute(
                 f"""
-                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms
+                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms
                 FROM harness_sessions
                 {where_sql}
                 ORDER BY created_at_ms DESC, session_id ASC
@@ -449,6 +713,8 @@ class SQLiteJournalStore(JournalStorageBackend):
         payload: dict[str, Any],
         tenant_id: str = "default",
         user_id: str = "anonymous",
+        branch_name: str | None = None,
+        parent_event_id: str | None = None,
     ) -> dict[str, Any]:
         ev_type = _normalize_event_type(event_type)
         payload_dict = dict(payload or {})
@@ -459,11 +725,76 @@ class SQLiteJournalStore(JournalStorageBackend):
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO harness_sessions
-                (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms)
-                VALUES (?, ?, ?, NULL, NULL, ?)
+                (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms)
+                VALUES (?, ?, ?, NULL, NULL, 'main', ?)
                 """,
                 (session_id, tenant_id, user_id, now_ms),
             )
+            if branch_name is not None and branch_name.strip():
+                eff_branch = branch_name.strip()
+            else:
+                sess_row = self._conn.execute(
+                    "SELECT active_branch FROM harness_sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                eff_branch = (
+                    str(sess_row["active_branch"] or "main")
+                    if sess_row is not None
+                    else "main"
+                )
+
+            branch_row = self._conn.execute(
+                """
+                SELECT head_event_id
+                FROM harness_branches
+                WHERE session_id = ? AND branch_name = ?
+                """,
+                (session_id, eff_branch),
+            ).fetchone()
+            if branch_row is None:
+                last_on_branch = self._conn.execute(
+                    """
+                    SELECT event_id
+                    FROM harness_events
+                    WHERE session_id = ? AND branch_name = ?
+                    ORDER BY seq DESC
+                    LIMIT 1
+                    """,
+                    (session_id, eff_branch),
+                ).fetchone()
+                branch_head: str | None = (
+                    str(last_on_branch["event_id"]) if last_on_branch is not None else None
+                )
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO harness_branches
+                    (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                    VALUES (?, ?, NULL, ?, ?)
+                    """,
+                    (session_id, eff_branch, branch_head, now_ms),
+                )
+            else:
+                branch_head = (
+                    str(branch_row["head_event_id"])
+                    if branch_row["head_event_id"] is not None
+                    else None
+                )
+                if branch_head is None:
+                    last_on_branch = self._conn.execute(
+                        """
+                        SELECT event_id
+                        FROM harness_events
+                        WHERE session_id = ? AND branch_name = ?
+                        ORDER BY seq DESC
+                        LIMIT 1
+                        """,
+                        (session_id, eff_branch),
+                    ).fetchone()
+                    if last_on_branch is not None:
+                        branch_head = str(last_on_branch["event_id"])
+
+            eff_parent_id = parent_event_id if parent_event_id is not None else branch_head
+
             last = self._conn.execute(
                 """
                 SELECT seq, event_hash
@@ -496,8 +827,9 @@ class SQLiteJournalStore(JournalStorageBackend):
                 """
                 INSERT INTO harness_events
                 (event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                 payload_json, tenant_id, user_id, prev_hash, event_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 payload_json, tenant_id, user_id, prev_hash, event_hash,
+                 parent_event_id, branch_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -511,7 +843,17 @@ class SQLiteJournalStore(JournalStorageBackend):
                     user_id,
                     prev_hash,
                     event_hash,
+                    eff_parent_id,
+                    eff_branch,
                 ),
+            )
+            self._conn.execute(
+                """
+                UPDATE harness_branches
+                SET head_event_id = ?
+                WHERE session_id = ? AND branch_name = ?
+                """,
+                (event_id, session_id, eff_branch),
             )
             self._conn.commit()
 
@@ -527,6 +869,8 @@ class SQLiteJournalStore(JournalStorageBackend):
             "user_id": user_id,
             "prev_hash": prev_hash,
             "event_hash": event_hash,
+            "parent_event_id": eff_parent_id,
+            "branch_name": eff_branch,
         }
 
     async def append_event(
@@ -537,6 +881,8 @@ class SQLiteJournalStore(JournalStorageBackend):
         payload: dict[str, Any],
         tenant_id: str = "default",
         user_id: str = "anonymous",
+        branch_name: str | None = None,
+        parent_event_id: str | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._append_event_sync,
@@ -546,6 +892,8 @@ class SQLiteJournalStore(JournalStorageBackend):
             payload,
             tenant_id,
             user_id,
+            branch_name,
+            parent_event_id,
         )
 
     def load_events_sync(
@@ -559,7 +907,8 @@ class SQLiteJournalStore(JournalStorageBackend):
                 rows = self._conn.execute(
                     """
                     SELECT event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                           payload_json, tenant_id, user_id, prev_hash, event_hash
+                           payload_json, tenant_id, user_id, prev_hash, event_hash,
+                           parent_event_id, branch_name
                     FROM harness_events
                     WHERE session_id = ? AND seq > ?
                     ORDER BY seq ASC
@@ -570,7 +919,8 @@ class SQLiteJournalStore(JournalStorageBackend):
                 rows = self._conn.execute(
                     """
                     SELECT event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                           payload_json, tenant_id, user_id, prev_hash, event_hash
+                           payload_json, tenant_id, user_id, prev_hash, event_hash,
+                           parent_event_id, branch_name
                     FROM harness_events
                     WHERE session_id = ? AND seq > ? AND seq <= ?
                     ORDER BY seq ASC
@@ -660,8 +1010,8 @@ class SQLiteJournalStore(JournalStorageBackend):
             self._conn.execute(
                 """
                 INSERT INTO harness_sessions
-                (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, 'main', ?)
                 """,
                 (
                     new_session_id,
@@ -674,6 +1024,7 @@ class SQLiteJournalStore(JournalStorageBackend):
             )
 
             prev_hash = GENESIS_HASH
+            prev_event_id: str | None = None
             new_seq = 0
             for src in source_rows:
                 new_seq += 1
@@ -697,8 +1048,9 @@ class SQLiteJournalStore(JournalStorageBackend):
                     """
                     INSERT INTO harness_events
                     (event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                     payload_json, tenant_id, user_id, prev_hash, event_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     payload_json, tenant_id, user_id, prev_hash, event_hash,
+                     parent_event_id, branch_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'main')
                     """,
                     (
                         ev_id,
@@ -712,9 +1064,11 @@ class SQLiteJournalStore(JournalStorageBackend):
                         ev_user,
                         prev_hash,
                         ev_hash,
+                        prev_event_id,
                     ),
                 )
                 prev_hash = ev_hash
+                prev_event_id = ev_id
 
             # Append canonical "session_forked" lineage event chained onto the copied history
             fork_seq = new_seq + 1
@@ -741,8 +1095,9 @@ class SQLiteJournalStore(JournalStorageBackend):
                 """
                 INSERT INTO harness_events
                 (event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                 payload_json, tenant_id, user_id, prev_hash, event_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 payload_json, tenant_id, user_id, prev_hash, event_hash,
+                 parent_event_id, branch_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'main')
                 """,
                 (
                     fork_event_id,
@@ -756,7 +1111,16 @@ class SQLiteJournalStore(JournalStorageBackend):
                     owner_user_id,
                     prev_hash,
                     fork_hash,
+                    prev_event_id,
                 ),
+            )
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO harness_branches
+                (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                VALUES (?, 'main', NULL, ?, ?)
+                """,
+                (new_session_id, fork_event_id, now_ms),
             )
             self._conn.commit()
 
@@ -766,6 +1130,7 @@ class SQLiteJournalStore(JournalStorageBackend):
                 owner_user_id=owner_user_id,
                 parent_session_id=source_session_id,
                 forked_from_seq=effective_seq,
+                active_branch="main",
                 created_at_ms=now_ms,
             )
             return record, len(source_rows)
@@ -786,6 +1151,361 @@ class SQLiteJournalStore(JournalStorageBackend):
             tenant_id,
             owner_user_id,
         )
+
+    def _create_branch_sync(
+        self,
+        session_id: str,
+        branch_name: str,
+        from_event_id: str | None = None,
+        *,
+        switch: bool = True,
+    ) -> BranchInfo:
+        clean_name = (branch_name or "").strip()
+        if not clean_name:
+            raise ValueError("Branch name must be a non-empty string.")
+
+        with self._lock:
+            existing_branch = self._conn.execute(
+                """
+                SELECT 1 FROM harness_branches
+                WHERE session_id = ? AND branch_name = ?
+                """,
+                (session_id, clean_name),
+            ).fetchone()
+            if existing_branch is not None:
+                raise ValueError(
+                    f"Branch '{clean_name}' already exists on session '{session_id}'."
+                )
+
+            sess_row = self._conn.execute(
+                "SELECT active_branch, created_at_ms FROM harness_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if clean_name == "main" and sess_row is not None:
+                has_main_events = self._conn.execute(
+                    "SELECT 1 FROM harness_events WHERE session_id = ? AND branch_name = 'main' LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if has_main_events is not None or str(sess_row["active_branch"] or "main") == "main":
+                    raise ValueError(
+                        f"Branch 'main' already exists on session '{session_id}'."
+                    )
+
+            cur_active = (
+                str(sess_row["active_branch"] or "main")
+                if sess_row is not None
+                else "main"
+            )
+            now_ms = int(time.time() * 1000)
+
+            if from_event_id is not None:
+                ev_row = self._conn.execute(
+                    "SELECT event_id FROM harness_events WHERE session_id = ? AND event_id = ?",
+                    (session_id, from_event_id),
+                ).fetchone()
+                if ev_row is None:
+                    raise KeyError(
+                        f"Event '{from_event_id}' not found in session '{session_id}'."
+                    )
+                resolved_base: str | None = from_event_id
+            else:
+                active_b_row = self._conn.execute(
+                    """
+                    SELECT head_event_id FROM harness_branches
+                    WHERE session_id = ? AND branch_name = ?
+                    """,
+                    (session_id, cur_active),
+                ).fetchone()
+                if active_b_row is not None and active_b_row["head_event_id"] is not None:
+                    resolved_base = str(active_b_row["head_event_id"])
+                else:
+                    latest_ev = self._conn.execute(
+                        """
+                        SELECT event_id FROM harness_events
+                        WHERE session_id = ?
+                        ORDER BY seq DESC
+                        LIMIT 1
+                        """,
+                        (session_id,),
+                    ).fetchone()
+                    resolved_base = str(latest_ev["event_id"]) if latest_ev is not None else None
+
+            if sess_row is None:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO harness_sessions
+                    (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms)
+                    VALUES (?, 'default', 'anonymous', NULL, NULL, 'main', ?)
+                    """,
+                    (session_id, now_ms),
+                )
+
+            if clean_name != "main":
+                main_b = self._conn.execute(
+                    "SELECT 1 FROM harness_branches WHERE session_id = ? AND branch_name = 'main'",
+                    (session_id,),
+                ).fetchone()
+                if main_b is None:
+                    last_main = self._conn.execute(
+                        """
+                        SELECT event_id FROM harness_events
+                        WHERE session_id = ? AND branch_name = 'main'
+                        ORDER BY seq DESC
+                        LIMIT 1
+                        """,
+                        (session_id,),
+                    ).fetchone()
+                    if last_main is not None:
+                        main_created = (
+                            int(sess_row["created_at_ms"])
+                            if sess_row is not None
+                            else now_ms
+                        )
+                        self._conn.execute(
+                            """
+                            INSERT OR IGNORE INTO harness_branches
+                            (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                            VALUES (?, 'main', NULL, ?, ?)
+                            """,
+                            (session_id, str(last_main["event_id"]), main_created),
+                        )
+
+            self._conn.execute(
+                """
+                INSERT INTO harness_branches
+                (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_id, clean_name, resolved_base, resolved_base, now_ms),
+            )
+
+            if switch:
+                self._conn.execute(
+                    "UPDATE harness_sessions SET active_branch = ? WHERE session_id = ?",
+                    (clean_name, session_id),
+                )
+                is_active = True
+            else:
+                is_active = cur_active == clean_name
+
+            event_count = 0
+            if resolved_base is not None:
+                ev_rows = self._conn.execute(
+                    """
+                    SELECT event_id, parent_event_id
+                    FROM harness_events
+                    WHERE session_id = ?
+                    ORDER BY seq ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+                light_events = [
+                    {"event_id": r["event_id"], "parent_event_id": r["parent_event_id"]}
+                    for r in ev_rows
+                ]
+                event_count = len(_walk_branch_chain(light_events, resolved_base))
+
+            self._conn.commit()
+
+        return BranchInfo(
+            branch_name=clean_name,
+            base_event_id=resolved_base,
+            head_event_id=resolved_base,
+            event_count=event_count,
+            is_active=is_active,
+            created_at_ms=now_ms,
+        )
+
+    async def create_branch(
+        self,
+        session_id: str,
+        branch_name: str,
+        from_event_id: str | None = None,
+        *,
+        switch: bool = True,
+    ) -> BranchInfo:
+        return await asyncio.to_thread(
+            self._create_branch_sync,
+            session_id,
+            branch_name,
+            from_event_id,
+            switch=switch,
+        )
+
+    def _switch_branch_sync(self, session_id: str, branch_name: str) -> BranchInfo:
+        target = (branch_name or "").strip()
+        if not target:
+            raise KeyError(f"Branch '{branch_name}' not found in session '{session_id}'.")
+
+        with self._lock:
+            sess_row = self._conn.execute(
+                "SELECT session_id, created_at_ms FROM harness_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if sess_row is None:
+                raise KeyError(f"Session '{session_id}' not found.")
+
+            branch_row = self._conn.execute(
+                """
+                SELECT branch_name, base_event_id, head_event_id, created_at_ms
+                FROM harness_branches
+                WHERE session_id = ? AND branch_name = ?
+                """,
+                (session_id, target),
+            ).fetchone()
+
+            if branch_row is None:
+                if target != "main":
+                    raise KeyError(
+                        f"Branch '{target}' not found in session '{session_id}'."
+                    )
+                last_main = self._conn.execute(
+                    """
+                    SELECT event_id FROM harness_events
+                    WHERE session_id = ? AND branch_name = 'main'
+                    ORDER BY seq DESC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                base_id: str | None = None
+                head_id: str | None = (
+                    str(last_main["event_id"]) if last_main is not None else None
+                )
+                created_ms = int(sess_row["created_at_ms"])
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO harness_branches
+                    (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                    VALUES (?, 'main', NULL, ?, ?)
+                    """,
+                    (session_id, head_id, created_ms),
+                )
+            else:
+                base_id = (
+                    str(branch_row["base_event_id"])
+                    if branch_row["base_event_id"] is not None
+                    else None
+                )
+                head_id = (
+                    str(branch_row["head_event_id"])
+                    if branch_row["head_event_id"] is not None
+                    else None
+                )
+                created_ms = int(branch_row["created_at_ms"])
+
+            self._conn.execute(
+                "UPDATE harness_sessions SET active_branch = ? WHERE session_id = ?",
+                (target, session_id),
+            )
+
+            event_count = 0
+            if head_id is not None:
+                ev_rows = self._conn.execute(
+                    """
+                    SELECT event_id, parent_event_id
+                    FROM harness_events
+                    WHERE session_id = ?
+                    ORDER BY seq ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+                light_events = [
+                    {"event_id": r["event_id"], "parent_event_id": r["parent_event_id"]}
+                    for r in ev_rows
+                ]
+                event_count = len(_walk_branch_chain(light_events, head_id))
+
+            self._conn.commit()
+
+        return BranchInfo(
+            branch_name=target,
+            base_event_id=base_id,
+            head_event_id=head_id,
+            event_count=event_count,
+            is_active=True,
+            created_at_ms=created_ms,
+        )
+
+    async def switch_branch(self, session_id: str, branch_name: str) -> BranchInfo:
+        return await asyncio.to_thread(self._switch_branch_sync, session_id, branch_name)
+
+    def _get_branch_events_sync(
+        self,
+        session_id: str,
+        branch_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            sess_row = self._conn.execute(
+                "SELECT active_branch FROM harness_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            active_branch = (
+                str(sess_row["active_branch"] or "main")
+                if sess_row is not None
+                else "main"
+            )
+            branch_rows = self._conn.execute(
+                """
+                SELECT branch_name, base_event_id, head_event_id, created_at_ms
+                FROM harness_branches
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchall()
+            branches_by_name = {
+                str(r["branch_name"]): dict(r) for r in branch_rows
+            }
+            all_events = self.load_events_sync(session_id)
+        return _resolve_branch_events(
+            all_events, active_branch, branches_by_name, branch_name=branch_name
+        )
+
+    async def get_branch_events(
+        self,
+        session_id: str,
+        branch_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._get_branch_events_sync, session_id, branch_name
+        )
+
+    def _get_session_tree_sync(self, session_id: str) -> SessionTreeResult:
+        with self._lock:
+            sess_row = self._conn.execute(
+                "SELECT active_branch, created_at_ms FROM harness_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            active_branch = (
+                str(sess_row["active_branch"] or "main")
+                if sess_row is not None
+                else "main"
+            )
+            sess_created = (
+                int(sess_row["created_at_ms"]) if sess_row is not None else None
+            )
+            branch_rows = [
+                dict(r)
+                for r in self._conn.execute(
+                    """
+                    SELECT branch_name, base_event_id, head_event_id, created_at_ms
+                    FROM harness_branches
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchall()
+            ]
+            all_events = self.load_events_sync(session_id)
+        return _build_session_tree(
+            session_id=session_id,
+            active_branch=active_branch,
+            session_created_at_ms=sess_created,
+            branch_rows=branch_rows,
+            all_events=all_events,
+        )
+
+    async def get_session_tree(self, session_id: str) -> SessionTreeResult:
+        return await asyncio.to_thread(self._get_session_tree_sync, session_id)
 
     def close(self) -> None:
         with self._lock:
@@ -858,6 +1578,7 @@ class PostgresJournalStore(JournalStorageBackend):
                     owner_user_id TEXT NOT NULL DEFAULT 'anonymous',
                     parent_session_id TEXT,
                     forked_from_seq INTEGER,
+                    active_branch TEXT NOT NULL DEFAULT 'main',
                     created_at_ms BIGINT NOT NULL
                 )
                 """
@@ -875,14 +1596,44 @@ class PostgresJournalStore(JournalStorageBackend):
                     tenant_id TEXT NOT NULL DEFAULT 'default',
                     user_id TEXT NOT NULL DEFAULT 'anonymous',
                     prev_hash TEXT NOT NULL DEFAULT '',
-                    event_hash TEXT NOT NULL DEFAULT ''
+                    event_hash TEXT NOT NULL DEFAULT '',
+                    parent_event_id TEXT,
+                    branch_name TEXT NOT NULL DEFAULT 'main'
                 )
                 """
             )
             await conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS harness_branches (
+                    session_id TEXT NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    base_event_id TEXT,
+                    head_event_id TEXT,
+                    created_at_ms BIGINT NOT NULL,
+                    PRIMARY KEY (session_id, branch_name)
+                )
+                """
+            )
+            # Forward-compatible column migrations for existing PostgreSQL deployments
+            await conn.execute(
+                "ALTER TABLE harness_sessions ADD COLUMN IF NOT EXISTS active_branch TEXT NOT NULL DEFAULT 'main'"
+            )
+            await conn.execute(
+                "ALTER TABLE harness_events ADD COLUMN IF NOT EXISTS parent_event_id TEXT"
+            )
+            await conn.execute(
+                "ALTER TABLE harness_events ADD COLUMN IF NOT EXISTS branch_name TEXT NOT NULL DEFAULT 'main'"
+            )
+            await conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_events_session_seq
                 ON harness_events (session_id, seq)
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_events_session_branch
+                ON harness_events (session_id, branch_name, seq)
                 """
             )
             await conn.execute(
@@ -900,6 +1651,7 @@ class PostgresJournalStore(JournalStorageBackend):
             owner_user_id=row["owner_user_id"],
             parent_session_id=row["parent_session_id"],
             forked_from_seq=row["forked_from_seq"],
+            active_branch=str(_row_field(row, "active_branch") or "main"),
             created_at_ms=int(row["created_at_ms"]),
         )
 
@@ -919,6 +1671,8 @@ class PostgresJournalStore(JournalStorageBackend):
             "user_id": row["user_id"],
             "prev_hash": row["prev_hash"],
             "event_hash": row["event_hash"],
+            "parent_event_id": _row_field(row, "parent_event_id", None),
+            "branch_name": str(_row_field(row, "branch_name") or "main"),
         }
 
     async def ensure_session(
@@ -935,8 +1689,8 @@ class PostgresJournalStore(JournalStorageBackend):
             await conn.execute(
                 """
                 INSERT INTO harness_sessions
-                (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms)
+                VALUES ($1, $2, $3, $4, $5, 'main', $6)
                 ON CONFLICT (session_id) DO NOTHING
                 """,
                 session_id,
@@ -948,7 +1702,7 @@ class PostgresJournalStore(JournalStorageBackend):
             )
             row = await conn.fetchrow(
                 """
-                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms
+                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms
                 FROM harness_sessions
                 WHERE session_id = $1
                 """,
@@ -962,7 +1716,7 @@ class PostgresJournalStore(JournalStorageBackend):
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms
+                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms
                 FROM harness_sessions
                 WHERE session_id = $1
                 """,
@@ -988,7 +1742,7 @@ class PostgresJournalStore(JournalStorageBackend):
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms
+                SELECT session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms
                 FROM harness_sessions
                 {where_sql}
                 ORDER BY created_at_ms DESC, session_id ASC
@@ -1005,6 +1759,8 @@ class PostgresJournalStore(JournalStorageBackend):
         payload: dict[str, Any],
         tenant_id: str = "default",
         user_id: str = "anonymous",
+        branch_name: str | None = None,
+        parent_event_id: str | None = None,
     ) -> dict[str, Any]:
         pool = await self.connect()
         ev_type = _normalize_event_type(event_type)
@@ -1018,8 +1774,8 @@ class PostgresJournalStore(JournalStorageBackend):
                 await conn.execute(
                     """
                     INSERT INTO harness_sessions
-                    (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms)
-                    VALUES ($1, $2, $3, NULL, NULL, $4)
+                    (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms)
+                    VALUES ($1, $2, $3, NULL, NULL, 'main', $4)
                     ON CONFLICT (session_id) DO NOTHING
                     """,
                     session_id,
@@ -1027,6 +1783,78 @@ class PostgresJournalStore(JournalStorageBackend):
                     user_id,
                     now_ms,
                 )
+                if branch_name is not None and branch_name.strip():
+                    eff_branch = branch_name.strip()
+                else:
+                    sess_row = await conn.fetchrow(
+                        "SELECT active_branch FROM harness_sessions WHERE session_id = $1",
+                        session_id,
+                    )
+                    eff_branch = (
+                        str(sess_row["active_branch"] or "main")
+                        if sess_row is not None
+                        else "main"
+                    )
+
+                branch_row = await conn.fetchrow(
+                    """
+                    SELECT head_event_id
+                    FROM harness_branches
+                    WHERE session_id = $1 AND branch_name = $2
+                    """,
+                    session_id,
+                    eff_branch,
+                )
+                if branch_row is None:
+                    last_on_branch = await conn.fetchrow(
+                        """
+                        SELECT event_id
+                        FROM harness_events
+                        WHERE session_id = $1 AND branch_name = $2
+                        ORDER BY seq DESC
+                        LIMIT 1
+                        """,
+                        session_id,
+                        eff_branch,
+                    )
+                    branch_head: str | None = (
+                        str(last_on_branch["event_id"]) if last_on_branch is not None else None
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO harness_branches
+                        (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                        VALUES ($1, $2, NULL, $3, $4)
+                        ON CONFLICT (session_id, branch_name) DO NOTHING
+                        """,
+                        session_id,
+                        eff_branch,
+                        branch_head,
+                        now_ms,
+                    )
+                else:
+                    branch_head = (
+                        str(branch_row["head_event_id"])
+                        if branch_row["head_event_id"] is not None
+                        else None
+                    )
+                    if branch_head is None:
+                        last_on_branch = await conn.fetchrow(
+                            """
+                            SELECT event_id
+                            FROM harness_events
+                            WHERE session_id = $1 AND branch_name = $2
+                            ORDER BY seq DESC
+                            LIMIT 1
+                            """,
+                            session_id,
+                            eff_branch,
+                        )
+                        if last_on_branch is not None:
+                            branch_head = str(last_on_branch["event_id"])
+
+                eff_parent_id = parent_event_id if parent_event_id is not None else branch_head
+
                 last = await conn.fetchrow(
                     """
                     SELECT seq, event_hash
@@ -1059,8 +1887,9 @@ class PostgresJournalStore(JournalStorageBackend):
                     """
                     INSERT INTO harness_events
                     (event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                     payload_json, tenant_id, user_id, prev_hash, event_hash)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     payload_json, tenant_id, user_id, prev_hash, event_hash,
+                     parent_event_id, branch_name)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                     """,
                     event_id,
                     session_id,
@@ -1073,6 +1902,18 @@ class PostgresJournalStore(JournalStorageBackend):
                     user_id,
                     prev_hash,
                     event_hash,
+                    eff_parent_id,
+                    eff_branch,
+                )
+                await conn.execute(
+                    """
+                    UPDATE harness_branches
+                    SET head_event_id = $1
+                    WHERE session_id = $2 AND branch_name = $3
+                    """,
+                    event_id,
+                    session_id,
+                    eff_branch,
                 )
 
         return {
@@ -1087,6 +1928,8 @@ class PostgresJournalStore(JournalStorageBackend):
             "user_id": user_id,
             "prev_hash": prev_hash,
             "event_hash": event_hash,
+            "parent_event_id": eff_parent_id,
+            "branch_name": eff_branch,
         }
 
     def load_events_sync(
@@ -1116,7 +1959,8 @@ class PostgresJournalStore(JournalStorageBackend):
                 rows = await conn.fetch(
                     """
                     SELECT event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                           payload_json, tenant_id, user_id, prev_hash, event_hash
+                           payload_json, tenant_id, user_id, prev_hash, event_hash,
+                           parent_event_id, branch_name
                     FROM harness_events
                     WHERE session_id = $1 AND seq > $2
                     ORDER BY seq ASC
@@ -1128,7 +1972,8 @@ class PostgresJournalStore(JournalStorageBackend):
                 rows = await conn.fetch(
                     """
                     SELECT event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                           payload_json, tenant_id, user_id, prev_hash, event_hash
+                           payload_json, tenant_id, user_id, prev_hash, event_hash,
+                           parent_event_id, branch_name
                     FROM harness_events
                     WHERE session_id = $1 AND seq > $2 AND seq <= $3
                     ORDER BY seq ASC
@@ -1215,8 +2060,8 @@ class PostgresJournalStore(JournalStorageBackend):
                 await conn.execute(
                     """
                     INSERT INTO harness_sessions
-                    (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, created_at_ms)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms)
+                    VALUES ($1, $2, $3, $4, $5, 'main', $6)
                     """,
                     new_session_id,
                     tenant_id,
@@ -1227,6 +2072,7 @@ class PostgresJournalStore(JournalStorageBackend):
                 )
 
                 prev_hash = GENESIS_HASH
+                prev_event_id: str | None = None
                 new_seq = 0
                 for src in source_rows:
                     new_seq += 1
@@ -1250,8 +2096,9 @@ class PostgresJournalStore(JournalStorageBackend):
                         """
                         INSERT INTO harness_events
                         (event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                         payload_json, tenant_id, user_id, prev_hash, event_hash)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                         payload_json, tenant_id, user_id, prev_hash, event_hash,
+                         parent_event_id, branch_name)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'main')
                         """,
                         ev_id,
                         new_session_id,
@@ -1264,8 +2111,10 @@ class PostgresJournalStore(JournalStorageBackend):
                         ev_user,
                         prev_hash,
                         ev_hash,
+                        prev_event_id,
                     )
                     prev_hash = ev_hash
+                    prev_event_id = ev_id
 
                 fork_seq = new_seq + 1
                 fork_payload_json = _canonical_payload_json(
@@ -1291,8 +2140,9 @@ class PostgresJournalStore(JournalStorageBackend):
                     """
                     INSERT INTO harness_events
                     (event_id, session_id, turn_id, seq, event_type, timestamp_ms,
-                     payload_json, tenant_id, user_id, prev_hash, event_hash)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     payload_json, tenant_id, user_id, prev_hash, event_hash,
+                     parent_event_id, branch_name)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'main')
                     """,
                     fork_event_id,
                     new_session_id,
@@ -1305,6 +2155,19 @@ class PostgresJournalStore(JournalStorageBackend):
                     owner_user_id,
                     prev_hash,
                     fork_hash,
+                    prev_event_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO harness_branches
+                    (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                    VALUES ($1, 'main', NULL, $2, $3)
+                    ON CONFLICT (session_id, branch_name)
+                    DO UPDATE SET head_event_id = EXCLUDED.head_event_id
+                    """,
+                    new_session_id,
+                    fork_event_id,
+                    now_ms,
                 )
 
         record = SessionRecord(
@@ -1313,9 +2176,380 @@ class PostgresJournalStore(JournalStorageBackend):
             owner_user_id=owner_user_id,
             parent_session_id=source_session_id,
             forked_from_seq=effective_seq,
+            active_branch="main",
             created_at_ms=now_ms,
         )
         return record, len(source_rows)
+
+    async def create_branch(
+        self,
+        session_id: str,
+        branch_name: str,
+        from_event_id: str | None = None,
+        *,
+        switch: bool = True,
+    ) -> BranchInfo:
+        clean_name = (branch_name or "").strip()
+        if not clean_name:
+            raise ValueError("Branch name must be a non-empty string.")
+
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+                existing_branch = await conn.fetchrow(
+                    """
+                    SELECT branch_name FROM harness_branches
+                    WHERE session_id = $1 AND branch_name = $2
+                    """,
+                    session_id,
+                    clean_name,
+                )
+                if existing_branch is not None:
+                    raise ValueError(
+                        f"Branch '{clean_name}' already exists on session '{session_id}'."
+                    )
+
+                sess_row = await conn.fetchrow(
+                    "SELECT active_branch, created_at_ms FROM harness_sessions WHERE session_id = $1",
+                    session_id,
+                )
+                if clean_name == "main" and sess_row is not None:
+                    has_main_events = await conn.fetchrow(
+                        "SELECT event_id FROM harness_events WHERE session_id = $1 AND branch_name = 'main' LIMIT 1",
+                        session_id,
+                    )
+                    if has_main_events is not None or str(sess_row["active_branch"] or "main") == "main":
+                        raise ValueError(
+                            f"Branch 'main' already exists on session '{session_id}'."
+                        )
+
+                cur_active = (
+                    str(sess_row["active_branch"] or "main")
+                    if sess_row is not None
+                    else "main"
+                )
+                now_ms = int(time.time() * 1000)
+
+                if from_event_id is not None:
+                    ev_row = await conn.fetchrow(
+                        "SELECT event_id FROM harness_events WHERE session_id = $1 AND event_id = $2",
+                        session_id,
+                        from_event_id,
+                    )
+                    if ev_row is None:
+                        raise KeyError(
+                            f"Event '{from_event_id}' not found in session '{session_id}'."
+                        )
+                    resolved_base: str | None = from_event_id
+                else:
+                    active_b_row = await conn.fetchrow(
+                        """
+                        SELECT head_event_id FROM harness_branches
+                        WHERE session_id = $1 AND branch_name = $2
+                        """,
+                        session_id,
+                        cur_active,
+                    )
+                    if active_b_row is not None and active_b_row["head_event_id"] is not None:
+                        resolved_base = str(active_b_row["head_event_id"])
+                    else:
+                        latest_ev = await conn.fetchrow(
+                            """
+                            SELECT event_id FROM harness_events
+                            WHERE session_id = $1
+                            ORDER BY seq DESC
+                            LIMIT 1
+                            """,
+                            session_id,
+                        )
+                        resolved_base = (
+                            str(latest_ev["event_id"]) if latest_ev is not None else None
+                        )
+
+                if sess_row is None:
+                    await conn.execute(
+                        """
+                        INSERT INTO harness_sessions
+                        (session_id, tenant_id, owner_user_id, parent_session_id, forked_from_seq, active_branch, created_at_ms)
+                        VALUES ($1, 'default', 'anonymous', NULL, NULL, 'main', $2)
+                        ON CONFLICT (session_id) DO NOTHING
+                        """,
+                        session_id,
+                        now_ms,
+                    )
+
+                if clean_name != "main":
+                    main_b = await conn.fetchrow(
+                        "SELECT branch_name FROM harness_branches WHERE session_id = $1 AND branch_name = 'main'",
+                        session_id,
+                    )
+                    if main_b is None:
+                        last_main = await conn.fetchrow(
+                            """
+                            SELECT event_id FROM harness_events
+                            WHERE session_id = $1 AND branch_name = 'main'
+                            ORDER BY seq DESC
+                            LIMIT 1
+                            """,
+                            session_id,
+                        )
+                        if last_main is not None:
+                            main_created = (
+                                int(sess_row["created_at_ms"])
+                                if sess_row is not None
+                                else now_ms
+                            )
+                            await conn.execute(
+                                """
+                                INSERT INTO harness_branches
+                                (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                                VALUES ($1, 'main', NULL, $2, $3)
+                                ON CONFLICT (session_id, branch_name) DO NOTHING
+                                """,
+                                session_id,
+                                str(last_main["event_id"]),
+                                main_created,
+                            )
+
+                await conn.execute(
+                    """
+                    INSERT INTO harness_branches
+                    (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    session_id,
+                    clean_name,
+                    resolved_base,
+                    resolved_base,
+                    now_ms,
+                )
+
+                if switch:
+                    await conn.execute(
+                        "UPDATE harness_sessions SET active_branch = $1 WHERE session_id = $2",
+                        clean_name,
+                        session_id,
+                    )
+                    is_active = True
+                else:
+                    is_active = cur_active == clean_name
+
+                event_count = 0
+                if resolved_base is not None:
+                    ev_rows = await conn.fetch(
+                        """
+                        SELECT event_id, parent_event_id
+                        FROM harness_events
+                        WHERE session_id = $1
+                        ORDER BY seq ASC
+                        """,
+                        session_id,
+                    )
+                    light_events = [
+                        {"event_id": r["event_id"], "parent_event_id": r["parent_event_id"]}
+                        for r in ev_rows
+                    ]
+                    event_count = len(_walk_branch_chain(light_events, resolved_base))
+
+        return BranchInfo(
+            branch_name=clean_name,
+            base_event_id=resolved_base,
+            head_event_id=resolved_base,
+            event_count=event_count,
+            is_active=is_active,
+            created_at_ms=now_ms,
+        )
+
+    async def switch_branch(self, session_id: str, branch_name: str) -> BranchInfo:
+        target = (branch_name or "").strip()
+        if not target:
+            raise KeyError(f"Branch '{branch_name}' not found in session '{session_id}'.")
+
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+                sess_row = await conn.fetchrow(
+                    "SELECT session_id, created_at_ms FROM harness_sessions WHERE session_id = $1",
+                    session_id,
+                )
+                if sess_row is None:
+                    raise KeyError(f"Session '{session_id}' not found.")
+
+                branch_row = await conn.fetchrow(
+                    """
+                    SELECT branch_name, base_event_id, head_event_id, created_at_ms
+                    FROM harness_branches
+                    WHERE session_id = $1 AND branch_name = $2
+                    """,
+                    session_id,
+                    target,
+                )
+
+                if branch_row is None:
+                    if target != "main":
+                        raise KeyError(
+                            f"Branch '{target}' not found in session '{session_id}'."
+                        )
+                    last_main = await conn.fetchrow(
+                        """
+                        SELECT event_id FROM harness_events
+                        WHERE session_id = $1 AND branch_name = 'main'
+                        ORDER BY seq DESC
+                        LIMIT 1
+                        """,
+                        session_id,
+                    )
+                    base_id: str | None = None
+                    head_id: str | None = (
+                        str(last_main["event_id"]) if last_main is not None else None
+                    )
+                    created_ms = int(sess_row["created_at_ms"])
+                    await conn.execute(
+                        """
+                        INSERT INTO harness_branches
+                        (session_id, branch_name, base_event_id, head_event_id, created_at_ms)
+                        VALUES ($1, 'main', NULL, $2, $3)
+                        ON CONFLICT (session_id, branch_name) DO NOTHING
+                        """,
+                        session_id,
+                        head_id,
+                        created_ms,
+                    )
+                else:
+                    base_id = (
+                        str(branch_row["base_event_id"])
+                        if branch_row["base_event_id"] is not None
+                        else None
+                    )
+                    head_id = (
+                        str(branch_row["head_event_id"])
+                        if branch_row["head_event_id"] is not None
+                        else None
+                    )
+                    created_ms = int(branch_row["created_at_ms"])
+
+                await conn.execute(
+                    "UPDATE harness_sessions SET active_branch = $1 WHERE session_id = $2",
+                    target,
+                    session_id,
+                )
+
+                event_count = 0
+                if head_id is not None:
+                    ev_rows = await conn.fetch(
+                        """
+                        SELECT event_id, parent_event_id
+                        FROM harness_events
+                        WHERE session_id = $1
+                        ORDER BY seq ASC
+                        """,
+                        session_id,
+                    )
+                    light_events = [
+                        {"event_id": r["event_id"], "parent_event_id": r["parent_event_id"]}
+                        for r in ev_rows
+                    ]
+                    event_count = len(_walk_branch_chain(light_events, head_id))
+
+        return BranchInfo(
+            branch_name=target,
+            base_event_id=base_id,
+            head_event_id=head_id,
+            event_count=event_count,
+            is_active=True,
+            created_at_ms=created_ms,
+        )
+
+    async def get_branch_events(
+        self,
+        session_id: str,
+        branch_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            sess_row = await conn.fetchrow(
+                "SELECT active_branch FROM harness_sessions WHERE session_id = $1",
+                session_id,
+            )
+            active_branch = (
+                str(sess_row["active_branch"] or "main")
+                if sess_row is not None
+                else "main"
+            )
+            branch_rows = await conn.fetch(
+                """
+                SELECT branch_name, base_event_id, head_event_id, created_at_ms
+                FROM harness_branches
+                WHERE session_id = $1
+                """,
+                session_id,
+            )
+            branches_by_name = {
+                str(r["branch_name"]): dict(r) for r in branch_rows
+            }
+            ev_rows = await conn.fetch(
+                """
+                SELECT event_id, session_id, turn_id, seq, event_type, timestamp_ms,
+                       payload_json, tenant_id, user_id, prev_hash, event_hash,
+                       parent_event_id, branch_name
+                FROM harness_events
+                WHERE session_id = $1
+                ORDER BY seq ASC
+                """,
+                session_id,
+            )
+            all_events = [self._row_to_event_dict(r) for r in ev_rows]
+        return _resolve_branch_events(
+            all_events, active_branch, branches_by_name, branch_name=branch_name
+        )
+
+    async def get_session_tree(self, session_id: str) -> SessionTreeResult:
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            sess_row = await conn.fetchrow(
+                "SELECT active_branch, created_at_ms FROM harness_sessions WHERE session_id = $1",
+                session_id,
+            )
+            active_branch = (
+                str(sess_row["active_branch"] or "main")
+                if sess_row is not None
+                else "main"
+            )
+            sess_created = (
+                int(sess_row["created_at_ms"]) if sess_row is not None else None
+            )
+            branch_rows = [
+                dict(r)
+                for r in await conn.fetch(
+                    """
+                    SELECT branch_name, base_event_id, head_event_id, created_at_ms
+                    FROM harness_branches
+                    WHERE session_id = $1
+                    """,
+                    session_id,
+                )
+            ]
+            ev_rows = await conn.fetch(
+                """
+                SELECT event_id, session_id, turn_id, seq, event_type, timestamp_ms,
+                       payload_json, tenant_id, user_id, prev_hash, event_hash,
+                       parent_event_id, branch_name
+                FROM harness_events
+                WHERE session_id = $1
+                ORDER BY seq ASC
+                """,
+                session_id,
+            )
+            all_events = [self._row_to_event_dict(r) for r in ev_rows]
+        return _build_session_tree(
+            session_id=session_id,
+            active_branch=active_branch,
+            session_created_at_ms=sess_created,
+            branch_rows=branch_rows,
+            all_events=all_events,
+        )
 
     def close(self) -> None:
         if self._owns_pool and self._pool is not None:

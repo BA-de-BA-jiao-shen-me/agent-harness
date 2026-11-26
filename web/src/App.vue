@@ -1,11 +1,15 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useHarnessStream } from './composables/useHarnessStream'
 
 const initialSessionId = `web_${Math.random().toString(36).slice(2, 8)}`
 const input = ref('')
 const sidebarTab = ref<'waterfall' | 'inbox'>('waterfall')
 const inboxNotes = ref<Record<string, string>>({})
+const selectedQuestionOptions = ref<string[]>([])
+const questionFreeText = ref('')
+const newBranchInput = ref('')
+const showBranchInput = ref(false)
 
 const {
   sessionId,
@@ -22,6 +26,12 @@ const {
   auditVerification,
   policyAlerts,
   subagentEvents,
+  pendingQuestion,
+  artifacts,
+  selectedArtifact,
+  activeBranch,
+  branches,
+  steeringNotices,
   sendMessage,
   reconnectStream,
   cancelTurn,
@@ -30,6 +40,14 @@ const {
   fetchApprovalInbox,
   resolveInboxApproval,
   verifyAuditChain,
+  sendSteer,
+  sendFollowup,
+  answerQuestion,
+  inspectArtifact,
+  closeArtifactViewer,
+  fetchSessionTree,
+  createBranch,
+  switchBranch,
 } = useHarnessStream(initialSessionId)
 
 const presets = [
@@ -39,11 +57,84 @@ const presets = [
   '委派 researcher 和 analyst 子代理排查高危隐患并统计停机时长',
 ]
 
+watch(
+  () => pendingQuestion.value?.question_id,
+  () => {
+    selectedQuestionOptions.value = []
+    questionFreeText.value = ''
+  }
+)
+
 function submit(text?: string) {
   const q = (text ?? input.value).trim()
   if (!q || isRunning.value) return
   input.value = ''
   sendMessage(q)
+}
+
+function handleComposerEnter() {
+  if (isRunning.value) {
+    handleSteer()
+  } else {
+    submit()
+  }
+}
+
+async function handleSteer() {
+  const msg = input.value.trim()
+  if (!msg || !isRunning.value) return
+  input.value = ''
+  await sendSteer(msg)
+}
+
+async function handleFollowup() {
+  const msg = input.value.trim()
+  if (!msg || !isRunning.value) return
+  input.value = ''
+  await sendFollowup(msg)
+}
+
+function toggleQuestionOption(optionId: string) {
+  if (!pendingQuestion.value) return
+  if (pendingQuestion.value.multi_select) {
+    const idx = selectedQuestionOptions.value.indexOf(optionId)
+    if (idx >= 0) {
+      selectedQuestionOptions.value.splice(idx, 1)
+    } else {
+      selectedQuestionOptions.value.push(optionId)
+    }
+  } else {
+    selectedQuestionOptions.value =
+      selectedQuestionOptions.value[0] === optionId ? [] : [optionId]
+  }
+}
+
+async function handleAnswerQuestion() {
+  if (!pendingQuestion.value) return
+  const freeText = questionFreeText.value.trim()
+  const selected = [...selectedQuestionOptions.value]
+  if (!selected.length && !freeText) return
+  const ok = await answerQuestion(selected, freeText)
+  if (ok) {
+    selectedQuestionOptions.value = []
+    questionFreeText.value = ''
+  }
+}
+
+async function handleBranchChange(event: Event) {
+  const target = event.target as HTMLSelectElement | null
+  if (!target || !target.value) return
+  await switchBranch(target.value)
+}
+
+async function handleCreateBranch() {
+  const name = newBranchInput.value.trim()
+  if (!name) return
+  const ok = await createBranch(name)
+  if (ok) {
+    newBranchInput.value = ''
+    showBranchInput.value = false
+  }
 }
 
 function switchTab(tab: 'waterfall' | 'inbox') {
@@ -61,6 +152,10 @@ async function handleInboxAction(approvalId: string, approved: boolean) {
 
 function eventAccent(eventType: string): string {
   if (eventType.includes('approval')) return '#f59e0b'
+  if (eventType.includes('question')) return '#06b6d4'
+  if (eventType.includes('steered') || eventType.includes('followup')) return '#f97316'
+  if (eventType.includes('artifact')) return '#22c55e'
+  if (eventType.includes('branch') || eventType.includes('compaction')) return '#8b5cf6'
   if (eventType.includes('security') || eventType.includes('policy') || eventType === 'error') return '#ef4444'
   if (eventType.includes('subagent')) return '#a855f7'
   if (eventType === 'turn_complete') return '#10b981'
@@ -78,6 +173,55 @@ function eventAccent(eventType: string): string {
           Session: <code>{{ sessionId }}</code>
           <span class="seq-badge">seq #{{ lastSeq }}</span>
         </span>
+        <div class="branch-switcher">
+          <span class="branch-label" title="当前会话分支">🌿</span>
+          <select
+            class="branch-select"
+            :value="activeBranch"
+            :disabled="isRunning"
+            title="切换会话分支"
+            @change="handleBranchChange"
+          >
+            <option
+              v-for="b in branches"
+              :key="b.branch_name"
+              :value="b.branch_name"
+            >
+              {{ b.branch_name }} ({{ b.event_count }})
+            </option>
+          </select>
+          <button
+            class="btn btn-slate btn-sm"
+            :disabled="isRunning"
+            title="创建新会话分支"
+            @click="showBranchInput = !showBranchInput"
+          >
+            + 分支
+          </button>
+          <template v-if="showBranchInput">
+            <input
+              v-model="newBranchInput"
+              class="branch-input"
+              placeholder="分支名称..."
+              @keyup.enter="handleCreateBranch()"
+            />
+            <button
+              class="btn btn-indigo btn-sm"
+              :disabled="isRunning || !newBranchInput.trim()"
+              @click="handleCreateBranch()"
+            >
+              创建
+            </button>
+          </template>
+          <button
+            class="btn btn-slate btn-sm"
+            :disabled="isRunning"
+            title="刷新分支树"
+            @click="fetchSessionTree()"
+          >
+            ↻ 树
+          </button>
+        </div>
       </div>
 
       <div class="controls-group">
@@ -133,6 +277,49 @@ function eventAccent(eventType: string): string {
         <div v-if="activeSkills.length" class="skills-row">
           <span class="row-label">Activated Skills:</span>
           <span v-for="sk in activeSkills" :key="sk" class="skill-chip">{{ sk }}</span>
+        </div>
+
+        <!-- Mid-Turn Steering / Follow-Up 通知条 -->
+        <div v-if="steeringNotices.length" class="steering-row">
+          <span v-for="(notice, idx) in steeringNotices" :key="idx" class="steering-pill">
+            {{ notice }}
+          </span>
+        </div>
+
+        <!-- Offloaded Artifacts 产物芯片条 -->
+        <div v-if="artifacts.length" class="artifacts-row">
+          <span class="row-label">Artifacts:</span>
+          <button
+            v-for="art in artifacts"
+            :key="art.artifact_id"
+            type="button"
+            class="artifact-chip"
+            :class="{ active: selectedArtifact?.artifact_id === art.artifact_id }"
+            :title="art.preview || art.artifact_id"
+            @click="inspectArtifact(art.artifact_id)"
+          >
+            📦 {{ art.tool_name }} ({{ art.char_count }} chars)
+          </button>
+        </div>
+
+        <!-- 内联可展开 Artifact Inspector 查看面板 -->
+        <div v-if="selectedArtifact" class="artifact-inspector">
+          <div class="artifact-inspector-head">
+            <div class="artifact-meta">
+              <strong>📦 {{ selectedArtifact.tool_name }}</strong>
+              <code class="artifact-id">{{ selectedArtifact.artifact_id }}</code>
+              <span class="artifact-chars">
+                {{ selectedArtifact.total_chars }} chars
+                <template v-if="selectedArtifact.has_more">
+                  （仅显示前 {{ selectedArtifact.limit }} 字符）
+                </template>
+              </span>
+            </div>
+            <button type="button" class="btn btn-slate btn-sm" @click="closeArtifactViewer()">
+              关闭
+            </button>
+          </div>
+          <pre class="code-block artifact-content">{{ selectedArtifact.content }}</pre>
         </div>
 
         <!-- Policy / Security Alert 横幅 -->
@@ -194,6 +381,45 @@ function eventAccent(eventType: string): string {
           </div>
         </div>
 
+        <!-- Interactive Clarification 交互式澄清卡片 -->
+        <div v-if="pendingQuestion" class="question-card">
+          <div class="question-title">
+            ❓ Agent 请求业务澄清：{{ pendingQuestion.question }}
+          </div>
+          <div v-if="pendingQuestion.options.length" class="question-options">
+            <button
+              v-for="opt in pendingQuestion.options"
+              :key="opt.id"
+              type="button"
+              class="option-pill"
+              :class="{ selected: selectedQuestionOptions.includes(opt.id) }"
+              @click="toggleQuestionOption(opt.id)"
+            >
+              <span class="option-label">{{ opt.label }}</span>
+              <span v-if="opt.description" class="option-desc">{{ opt.description }}</span>
+            </button>
+          </div>
+          <div v-if="pendingQuestion.multi_select && pendingQuestion.options.length" class="question-hint">
+            支持多选（已选 {{ selectedQuestionOptions.length }} 项）
+          </div>
+          <input
+            v-if="pendingQuestion.allow_free_text"
+            v-model="questionFreeText"
+            class="question-input"
+            placeholder="补充说明或自由输入回答..."
+            @keyup.enter="handleAnswerQuestion()"
+          />
+          <div class="action-row">
+            <button
+              class="btn btn-cyan"
+              :disabled="!selectedQuestionOptions.length && !questionFreeText.trim()"
+              @click="handleAnswerQuestion()"
+            >
+              提交澄清回答
+            </button>
+          </div>
+        </div>
+
         <!-- 流式输出主区域 -->
         <main class="answer-box">
           {{
@@ -202,16 +428,38 @@ function eventAccent(eventType: string): string {
           }}
         </main>
 
-        <!-- 输入与发送/停止控制栏 -->
+        <!-- 输入与发送/纠偏/追加/停止控制栏 -->
         <footer class="composer">
           <input
             v-model="input"
             class="composer-input"
-            placeholder="输入业务问题或分析指令..."
-            @keyup.enter="submit()"
+            :placeholder="
+              isRunning
+                ? '运行中：输入指令可点击「⚡ 纠偏」立即转向，或「📥 追加」轮后自动执行...'
+                : '输入业务问题或分析指令...'
+            "
+            @keyup.enter="handleComposerEnter()"
           />
           <button v-if="!isRunning" class="btn btn-primary" @click="submit()">发送</button>
-          <button v-else class="btn btn-red" @click="cancelTurn()">停止中断</button>
+          <template v-else>
+            <button
+              class="btn btn-amber"
+              :disabled="!input.trim()"
+              title="立即中断当前执行计划并按新指令纠偏"
+              @click="handleSteer()"
+            >
+              ⚡ 纠偏
+            </button>
+            <button
+              class="btn btn-indigo"
+              :disabled="!input.trim()"
+              title="排队等待本轮完成后自动执行追加任务"
+              @click="handleFollowup()"
+            >
+              📥 追加
+            </button>
+            <button class="btn btn-red" @click="cancelTurn()">停止</button>
+          </template>
         </footer>
       </section>
 
@@ -812,5 +1060,208 @@ function eventAccent(eventType: string): string {
 
 .btn-red {
   background: #dc2626;
+}
+
+.btn-amber {
+  background: #d97706;
+}
+
+.btn-cyan {
+  background: #0891b2;
+}
+
+.branch-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 4px 8px;
+}
+
+.branch-label {
+  font-size: 13px;
+}
+
+.branch-select {
+  background: #1e293b;
+  color: #e2e8f0;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.branch-input {
+  width: 120px;
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.steering-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.steering-pill {
+  background: #431407;
+  color: #fdba74;
+  border: 1px solid #f97316;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.artifacts-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.artifact-chip {
+  background: #052e16;
+  color: #86efac;
+  border: 1px solid #22c55e;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.artifact-chip:hover,
+.artifact-chip.active {
+  background: #14532d;
+  border-color: #4ade80;
+  color: #dcfce7;
+}
+
+.artifact-inspector {
+  background: #022c22;
+  border: 1px solid #22c55e;
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.artifact-inspector-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.artifact-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #bbf7d0;
+}
+
+.artifact-id {
+  background: #0f172a;
+  color: #86efac;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+.artifact-chars {
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.artifact-content {
+  max-height: 240px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.question-card {
+  background: #083344;
+  border: 1px solid #06b6d4;
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.question-title {
+  font-weight: 700;
+  color: #67e8f9;
+  font-size: 14px;
+}
+
+.question-options {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.option-pill {
+  background: #0f172a;
+  color: #e0f2fe;
+  border: 1px solid #0891b2;
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+}
+
+.option-pill:hover {
+  border-color: #22d3ee;
+  background: #164e63;
+}
+
+.option-pill.selected {
+  background: #0e7490;
+  border-color: #67e8f9;
+  color: #ffffff;
+}
+
+.option-label {
+  font-weight: 600;
+}
+
+.option-desc {
+  font-size: 11px;
+  color: #bae6fd;
+}
+
+.question-hint {
+  font-size: 11px;
+  color: #a5f3fc;
+}
+
+.question-input {
+  background: #0f172a;
+  color: #f8fafc;
+  border: 1px solid #0891b2;
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 12px;
 }
 </style>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from abc import ABC, abstractmethod
@@ -20,6 +21,23 @@ from pyharness.runtime.schemas import (
 _RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 
 
+def _supports_kwarg(fn: Any, name: str) -> bool:
+    """Safely inspect whether `fn` accepts keyword argument `name` (explicitly or via `**kwargs`)."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
 class BaseLLMClient(ABC):
     """Unified async LLM interface supporting both single-shot completion and live SSE streaming."""
 
@@ -28,6 +46,8 @@ class BaseLLMClient(ABC):
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        *,
+        prompt_cache_key: str | None = None,
     ) -> LLMResponse:
         raise NotImplementedError
 
@@ -35,12 +55,19 @@ class BaseLLMClient(ABC):
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        *,
+        prompt_cache_key: str | None = None,
     ) -> AsyncIterator[LLMStreamChunk]:
         """
         Default streaming adapter delegating to `complete()` so custom/mock subclasses work
         seamlessly without boilerplate, while `OpenAICompatibleLLMClient` overrides with live SSE.
         """
-        resp = await self.complete(messages, tools=tools)
+        if _supports_kwarg(self.complete, "prompt_cache_key"):
+            resp = await self.complete(
+                messages, tools=tools, prompt_cache_key=prompt_cache_key
+            )
+        else:
+            resp = await self.complete(messages, tools=tools)
         if resp.reasoning_content:
             yield LLMStreamChunk(reasoning_delta=resp.reasoning_content, model=resp.model)
         if resp.content and not resp.tool_calls:
@@ -50,6 +77,7 @@ class BaseLLMClient(ABC):
             tool_calls=resp.tool_calls,
             usage=resp.usage,
             model=resp.model,
+            finish_reason=resp.finish_reason,
             is_final=True,
         )
 
@@ -167,6 +195,8 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        *,
+        prompt_cache_key: str | None = None,
     ) -> LLMResponse:
         body: dict[str, Any] = {
             "model": self.model,
@@ -175,6 +205,8 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
         if tools:
             body["tools"] = [t.to_openai_schema() for t in tools]
             body["tool_choice"] = "auto"
+        if prompt_cache_key and prompt_cache_key.strip():
+            body["prompt_cache_key"] = prompt_cache_key
 
         t0 = time.perf_counter()
         last_exc: Exception | None = None
@@ -203,7 +235,9 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
             raise last_exc
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        choice = data["choices"][0]["message"]
+        choice0 = data["choices"][0]
+        choice = choice0["message"]
+        finish_reason = str(choice0.get("finish_reason") or "stop")
         parsed_calls = [
             self._parse_raw_tool_call(
                 raw_tc.get("id", ""),
@@ -220,12 +254,15 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
             usage=self._build_usage(data.get("usage")),
             model=data.get("model", self.model),
             latency_ms=round(latency_ms, 2),
+            finish_reason=finish_reason,
         )
 
     async def stream(
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        *,
+        prompt_cache_key: str | None = None,
     ) -> AsyncIterator[LLMStreamChunk]:
         body: dict[str, Any] = {
             "model": self.model,
@@ -236,10 +273,13 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
         if tools:
             body["tools"] = [t.to_openai_schema() for t in tools]
             body["tool_choice"] = "auto"
+        if prompt_cache_key and prompt_cache_key.strip():
+            body["prompt_cache_key"] = prompt_cache_key
 
         tc_buffers: dict[int, dict[str, str]] = {}
         final_usage: TokenUsage | None = None
         seen_model = self.model
+        finish_reason: str | None = None
 
         for attempt in range(self.max_retries + 1):
             try:
@@ -270,7 +310,10 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
                         choices = frame.get("choices") or []
                         if not choices:
                             continue
-                        delta = choices[0].get("delta") or {}
+                        choice0 = choices[0]
+                        if choice0.get("finish_reason"):
+                            finish_reason = str(choice0["finish_reason"])
+                        delta = choice0.get("delta") or {}
 
                         r_delta = delta.get("reasoning_content") or ""
                         c_delta = delta.get("content") or ""
@@ -312,6 +355,7 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
             tool_calls=assembled_calls,
             usage=final_usage or TokenUsage(),
             model=seen_model,
+            finish_reason=finish_reason or "stop",
             is_final=True,
         )
 
@@ -335,14 +379,18 @@ class ScriptedMockLLMClient(BaseLLMClient):
         self.chunk_size = chunk_size
         self.call_history: list[list[Message]] = []
         self.tools_history: list[list[str]] = []
+        self.cache_keys_history: list[str | None] = []
 
     async def complete(
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        *,
+        prompt_cache_key: str | None = None,
     ) -> LLMResponse:
         self.call_history.append([m.model_copy(deep=True) for m in messages])
         self.tools_history.append([t.name for t in (tools or [])])
+        self.cache_keys_history.append(prompt_cache_key)
         if not self._responses:
             return LLMResponse(content="(mock exhausted)", model="scripted-mock")
         nxt = self._responses.pop(0)
@@ -354,13 +402,19 @@ class ScriptedMockLLMClient(BaseLLMClient):
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        *,
+        prompt_cache_key: str | None = None,
     ) -> AsyncIterator[LLMStreamChunk]:
         if self.chunk_size is None or self.chunk_size <= 0:
-            async for ch in super().stream(messages, tools=tools):
+            async for ch in super().stream(
+                messages, tools=tools, prompt_cache_key=prompt_cache_key
+            ):
                 yield ch
             return
 
-        resp = await self.complete(messages, tools=tools)
+        resp = await self.complete(
+            messages, tools=tools, prompt_cache_key=prompt_cache_key
+        )
         step = self.chunk_size
         if resp.reasoning_content:
             for i in range(0, len(resp.reasoning_content), step):
@@ -379,5 +433,6 @@ class ScriptedMockLLMClient(BaseLLMClient):
             tool_calls=resp.tool_calls,
             usage=resp.usage,
             model=resp.model,
+            finish_reason=resp.finish_reason,
             is_final=True,
         )
